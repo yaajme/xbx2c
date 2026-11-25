@@ -1138,6 +1138,64 @@ mod relay_tests {
     }
 }
 
+/// Bytes copied from title memory since the last [`echo_line`]: [changed, not
+/// put there by us], [the copy held them already], [ours, others' bytes
+/// beside], [ours, held already]; then the same of copies in the card's memory.
+#[cfg(feature = "diagnostics")]
+static ECHO: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// Pages we wrote back and did not copy since, by copy: (copy, page).
+#[cfg(feature = "diagnostics")]
+static ECHO_OURS: Mutex<Option<std::collections::HashSet<(u64, usize)>>> = Mutex::new(None);
+/// Times we wrote pieces back, and the 64 KiB pages they touched.
+#[cfg(feature = "diagnostics")]
+static ECHO_BACK: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+#[cfg(feature = "diagnostics")]
+fn echo_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ECHO").is_some_and(|v| v == "1"))
+}
+
+/// Copy `id` put `[at, at + n)` back into title memory.
+#[cfg(feature = "diagnostics")]
+fn echo_ours(id: u64, at: usize, n: usize) {
+    if !echo_on() || n == 0 {
+        return;
+    }
+    ECHO_BACK[0].fetch_add(1, Ordering::Relaxed);
+    let mut ours = ECHO_OURS.lock().unwrap_or_else(|e| e.into_inner());
+    let ours = ours.get_or_insert_with(Default::default);
+    for page in at / PAGE..(at + n).div_ceil(PAGE) {
+        ours.insert((id, page));
+        ECHO_BACK[1].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// For the frame line.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn echo_line(frames: f64) {
+    if !echo_on() {
+        return;
+    }
+    let mb = |k: usize| ECHO[k].swap(0, Ordering::Relaxed) as f64 / frames / 1048576.0;
+    let v: Vec<f64> = (0..8).map(mb).collect();
+    tracing::info!(
+        "echo per frame: copied {:.1} MB; not ours: {:.1} changed, {:.1} held already; ours: {:.1} with other changes, {:.1} held already; of these on the card: {:.1}, {:.1}, {:.1}, {:.1}; put back {:.0} pieces on {:.0} pages",
+        v[0] + v[1] + v[2] + v[3], v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
+        ECHO_BACK[0].swap(0, Ordering::Relaxed) as f64 / frames,
+        ECHO_BACK[1].swap(0, Ordering::Relaxed) as f64 / frames
+    );
+}
+
+/// Whether a copy in the card's memory takes only what differs from what it
+/// holds (`VICTORY_SKIP_SAME=1`; off by default): in gameplay some 45 MB a
+/// frame of pages found written hold the bytes they held, and the pages that
+/// do change do so in part.
+fn skip_same() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_SAME").is_some_and(|v| v == "1"))
+}
+
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
@@ -3043,12 +3101,93 @@ impl Shadow {
         bytes
     }
 
+    /// Diagnostics (`VICTORY_ECHO=1`): title memory `[from, to)` is about to
+    /// be copied. By 64 KiB page: whether the copy holds these bytes already,
+    /// and whether what we put back into title memory there ([`echo_ours`])
+    /// is what made the page look written.
+    #[cfg(feature = "diagnostics")]
+    fn echo(&self, from: usize, to: usize) {
+        if !echo_on() {
+            return;
+        }
+        let start = self.start as usize;
+        let mut page = vec![0u8; PAGE];
+        let mut at = from;
+        while at < to {
+            let n = ((at / PAGE + 1) * PAGE).min(to) - at;
+            let ours = ECHO_OURS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+                .is_some_and(|m| m.remove(&(self.id, at / PAGE)));
+            // SAFETY: inside the mapping, as in `copy`.
+            let held = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
+            let same = crate::host::read_into(at as *const u8, &mut page[..n]) && held == &page[..n];
+            let k = usize::from(ours) * 2 + usize::from(same);
+            ECHO[k].fetch_add(n as u64, Ordering::Relaxed);
+            if self.card.is_some() {
+                ECHO[4 + k].fetch_add(n as u64, Ordering::Relaxed);
+            }
+            at += n;
+        }
+    }
+
+    /// [`Shadow::copy`] for a copy in the card's memory: title memory is read
+    /// beside the copy, and only the 4 KiB pieces that differ from what the
+    /// copy holds are taken and go up to the card. `[from, to)` lies in the
+    /// buffer. Returns the bytes taken.
+    fn copy_changed(&self, from: usize, to: usize) -> usize {
+        const PIECE_SAME: usize = 4096;
+        thread_local! {
+            static ROOM: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let start = self.start as usize;
+        ROOM.with_borrow_mut(|room| {
+            room.resize(PAGE, 0);
+            let (mut at, mut taken) = (from, 0);
+            while at < to {
+                let n = ((at / PAGE + 1) * PAGE).min(to) - at;
+                crate::host::copy_mapped(room.as_mut_ptr(), at as *const u8, n, false);
+                // SAFETY: inside the mapping (the caller's range); only
+                // refreshes write these bytes, one at a time, and shaders'
+                // results only where no refresh does.
+                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
+                let mut run: Option<usize> = None;
+                let mut k = 0;
+                while k < n {
+                    let end = (k + PIECE_SAME).min(n);
+                    if held[k..end] != room[k..end] {
+                        held[k..end].copy_from_slice(&room[k..end]);
+                        run.get_or_insert(k);
+                    } else if let Some(first) = run.take() {
+                        self.changed(at - start + first, at - start + k);
+                        self.card_changed(at - start + first, at - start + k);
+                        taken += k - first;
+                    }
+                    k = end;
+                }
+                if let Some(first) = run {
+                    self.changed(at - start + first, at - start + n);
+                    self.card_changed(at - start + first, at - start + n);
+                    taken += n - first;
+                }
+                at += n;
+            }
+            taken
+        })
+    }
+
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
+        #[cfg(feature = "diagnostics")]
+        self.echo(from, to);
+        if self.card.is_some() && skip_same() {
+            return self.copy_changed(from, to);
+        }
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
@@ -3280,9 +3419,29 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
+        if crate::watch::beside_on()
+            && let Some((before, now)) = crate::watch::write_beside(start + at, title.as_ptr(), n)
+        {
+            // This copy holds these bytes (`held`, merged above): if it had
+            // the page as last written, it has it now. Not waited for: a
+            // refresh may hold it and want the lock held here; the page is
+            // then copied once more, as before.
+            if let Ok(mut copied) = self.copied.try_lock()
+                && let Some(had) = copied.get_mut((start + at) / PAGE - start / PAGE)
+                && *had != 0
+                && *had >= before
+            {
+                *had = now;
+            }
+            // A placed texture there changes with no descriptor written.
+            crate::descriptor::host::remapped(start + at, n);
+            return n;
+        }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        #[cfg(feature = "diagnostics")]
+        echo_ours(self.id, start + at, n);
         n
     }
 }

@@ -2364,6 +2364,60 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// Whether a small fill of upload memory (a constant buffer) goes ahead of
+/// flights that declared they may write where it reads
+/// (`VICTORY_FILL_FREE=1`; off by default). One such fill a frame, of 480
+/// bytes, waits about 40 ms for flights that declared a heap of 174 MB whole.
+/// One in 8 of those let through is looked at again when the flights have
+/// landed ([`fills_landed`]): whether the bytes it read are others then.
+/// shortcut: that looks, it does not repair: a constant buffer a shader does
+/// write is read as it was before. Not for the title's buffer copies: let
+/// ahead in the same way they lost the card at world load, twice of two.
+fn fill_free() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_FREE").is_some_and(|v| v == "1"))
+}
+
+/// Fills let through and looked at again: the last submission started then,
+/// where they read, and the bytes there.
+static FILLS_FREE: Mutex<Vec<(u64, usize, Vec<u8>)>> = Mutex::new(Vec::new());
+
+fn fill_through(src: usize, len: usize) {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if !COUNT.fetch_add(1, Ordering::Relaxed).is_multiple_of(8) {
+        return;
+    }
+    let mut fills = FILLS_FREE.lock().unwrap_or_else(|e| e.into_inner());
+    if fills.len() < 4096 {
+        let mut bytes = vec![0u8; len];
+        copy_mapped(bytes.as_mut_ptr(), src as *const u8, len, false);
+        fills.push((STARTED.load(Ordering::Acquire), src, bytes));
+    }
+}
+
+/// The flights up to `last` have landed: see [`fill_free`].
+fn fills_landed(last: u64) {
+    static SEEN: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+    if !fill_free() {
+        return;
+    }
+    let done: Vec<_> = {
+        let mut fills = FILLS_FREE.lock().unwrap_or_else(|e| e.into_inner());
+        let (done, left) = std::mem::take(&mut *fills).into_iter().partition(|f| f.0 <= last);
+        *fills = left;
+        done
+    };
+    for (_, src, was) in done {
+        let mut now = vec![0u8; was.len()];
+        copy_mapped(now.as_mut_ptr(), src as *const u8, now.len(), false);
+        let seen = SEEN[0].fetch_add(1, Ordering::Relaxed) + 1;
+        let other = SEEN[1].fetch_add(u64::from(now != was), Ordering::Relaxed) + u64::from(now != was);
+        if seen.is_multiple_of(64) {
+            tracing::info!("fills let ahead of flights, looked at: {seen}, of them {other} read bytes that were others once the flights had landed");
+        }
+    }
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
@@ -2377,6 +2431,10 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 &Step::Copy(dst, src, len) => {
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         if count {
+                            static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                            if SEEN.fetch_add(1, Ordering::Relaxed) % 64 == 0 {
+                                tracing::info!("a copy waits for flights: {src:#x} to {dst:#x}, {len:#x} bytes");
+                            }
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
                         }
                         return Some(WHY_READ);
@@ -2384,6 +2442,12 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 }
                 &Step::Fill(_, src, len) => {
                     if touches(written, src, src + len) {
+                        if fill_free() && len <= 1 << 16 {
+                            if count {
+                                fill_through(src, len);
+                            }
+                            continue;
+                        }
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                         }
@@ -2652,6 +2716,25 @@ struct RelayFetch {
     sent: u64,
     /// Buffer, mapping, bytes.
     buffer: Option<(ID3D12Resource, usize, u64)>,
+    /// A copy queue of the fetches' own ([`copy_fetch`]); `list` is of its type.
+    queue: Option<ID3D12CommandQueue>,
+}
+
+/// Whether the relay fetches what shaders wrote on a copy queue of its own
+/// (`VICTORY_COPY_FETCH=1`; off by default). On the queue everything else
+/// runs on, a fetch stood behind all the work sent after the flights it
+/// fetches for (169 ms of a 276 ms frame waiting for 98 MB), and with it
+/// the landing, what waits for it, and the fences the title waits for.
+///
+/// A fetch here may run beside later work: it reads bytes that a later
+/// flight's shaders or sends write meanwhile. Later shader writes merged
+/// early are found merged by their own flight's landing, as when a fetch
+/// stood behind them. Title bytes: only the sends of the flights that have
+/// run are known to have arrived, so every later send's ranges are left
+/// out of the merge ([`CardPlan::sent_as`]).
+fn copy_fetch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_FETCH").is_some_and(|v| v == "1"))
 }
 
 /// The thread that lands flights ([`relay`]): as soon as the card has run
@@ -2978,7 +3061,7 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
 /// runtime, the read requests that fail (with 2: every request).
 pub(crate) fn walls_trace() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WALLS_TRACE").is_some_and(|v| v == "1" || v == "2"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WALLS_TRACE").is_some_and(|v| v == "1"))
 }
 
 /// After `list` has run: the texels its read-backs copied into host
@@ -3705,7 +3788,20 @@ impl Host {
 
     /// The relay's own list, fence, event for [`Host::relay_card_back`].
     fn make_relay_fetch(&self) -> Option<RelayFetch> {
-        let list = self.make_prelude()?;
+        // SAFETY: plain objects of our own.
+        let (list, queue) = if copy_fetch() {
+            unsafe {
+                let kind = D3D12_COMMAND_LIST_TYPE_COPY;
+                let desc = D3D12_COMMAND_QUEUE_DESC { Type: kind, ..Default::default() };
+                let queue: ID3D12CommandQueue = self.device.CreateCommandQueue(&desc).ok()?;
+                let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(kind).ok()?;
+                let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(0, kind, &allocator, None).ok()?;
+                list.Close().ok()?;
+                ((allocator, list), Some(queue))
+            }
+        } else {
+            (self.make_prelude()?, None)
+        };
         // SAFETY: plain objects of our own.
         unsafe {
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
@@ -3716,6 +3812,7 @@ impl Host {
                 event,
                 sent: 0,
                 buffer: None,
+                queue,
             })
         }
     }
@@ -3783,7 +3880,7 @@ impl Host {
             }
         }
         if pieces.is_empty() {
-            if inflight_fetch() {
+            if inflight_fetch() || copy_fetch() {
                 // The next merge may be of a flight in the air now, with
                 // bytes from when it ran: only sends up to these plans' are
                 // older than it.
@@ -3814,6 +3911,9 @@ impl Host {
         };
         f.sent += 1;
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
+        let own_queue = f.queue.clone();
+        // What the landed flights were sent behind has run.
+        let arrived = plans.iter().map(|p| p.sent_as).max().unwrap_or(0);
         let waiting = std::time::Instant::now();
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
@@ -3827,6 +3927,13 @@ impl Host {
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
+                if let Some(queue) = &own_queue {
+                    queue.ExecuteCommandLists(&lists);
+                    queue.Signal(&fence, sent)?;
+                    fence.SetEventOnCompletion(sent, event)?;
+                    WaitForSingleObject(event, INFINITE);
+                    return Ok(arrived);
+                }
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -4112,6 +4219,7 @@ impl Host {
             }
         }
         if last > 0 {
+            fills_landed(last);
             FINISHED.store(last, Ordering::Release);
             bury(last);
         }
@@ -6023,7 +6131,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    // (A title destination may be missing too: the kernel says so.)
+    let whole = if title_dst { read_kernel(src, dst, len) } else { read(src, dst, len) };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -6086,10 +6195,10 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
     // that fails), zeros for what cannot be read.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
+        if !read_kernel(at as *const u8, to, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
+                if !read_kernel(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
                     // SAFETY: inside the destination, which is mapped.
@@ -6109,6 +6218,16 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    if crate::safe_copy::on() {
+        // SAFETY: the destination is mapped writable memory of `len` bytes; a
+        // source page that is not there ends the copy with `false`.
+        return unsafe { crate::safe_copy::copy(dst, src, len) };
+    }
+    read_kernel(src, dst, len)
+}
+
+/// [`read`] by the kernel, which checks the destination too.
+fn read_kernel(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
@@ -6129,6 +6248,14 @@ unsafe extern "system" {
         size: usize,
         written: *mut usize,
     ) -> i32;
+}
+
+/// Writes `len` bytes by the kernel; `false` if not all of `dst` is there.
+pub(crate) fn write_kernel(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut done = 0;
+    // SAFETY: the source is live memory of ours; the kernel checks the rest.
+    unsafe { NtWriteVirtualMemory(GetCurrentProcess(), dst.cast(), src.cast(), len, &mut done) >= 0 && done == len }
 }
 
 /// Whether title memory is written with the kernel's own call
@@ -6395,6 +6522,12 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
+        #[cfg(feature = "diagnostics")]
+        crate::shadow::echo_line(frames);
+        if crate::watch::beside_on() {
+            let n = [0, 1].map(|k| crate::watch::BESIDE[k].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!("shader writes put back beside the guards per frame: {:.0}, the old way {:.0}", n[0], n[1]);
+        }
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         {

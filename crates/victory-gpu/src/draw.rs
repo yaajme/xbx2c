@@ -184,6 +184,70 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
+/// Whether a single indirect draw without a count reads its record straight
+/// from the title's buffer (`VICTORY_INDIRECT_DIRECT=1`; off by default).
+///
+/// The clamp (`crate::indirect::bound`) runs a compute pass before each of
+/// some 5,100 draws a frame, and the card goes from drawing to compute and
+/// back for every one: on an RTX 4090 4.3 microseconds a draw against 0.01
+/// (`bare_command_cost`, (a) and (h)), with or without the waits around it.
+/// Here the draws have nothing between them; what shaders wrote is waited
+/// for once, after the commands that may write arguments.
+///
+/// Mesh draws only (some 4,200 of them). Vertex draws keep the clamp: the
+/// tiled lighting takes its counts from compute programs that a card of
+/// 32-lane waves refuses, and unclamped garbage there hung the card at world
+/// load in three launches of eight (stopped in an `indirect kind 0`).
+///
+/// shortcut: no guard for the mesh draws. A record of garbage asks the card
+/// for whatever it holds and may hang it; in some thirty logged runs the
+/// most a drawn record asked for was 1,453 groups.
+fn direct_indirect() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_DIRECT").is_some_and(|v| v == "1") && enhanced_barriers())
+}
+
+/// Whether the host has enhanced barriers.
+fn enhanced_barriers() -> bool {
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+    // SAFETY: a plain query into our structure.
+    let asked = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS12,
+            (&raw mut options).cast(),
+            size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS12>() as u32,
+        )
+    };
+    let on = asked.is_ok() && options.EnhancedBarriersSupported.as_bool();
+    tracing::info!(on, "indirect draws straight from the title's arguments (VICTORY_INDIRECT_DIRECT)");
+    on
+}
+
+/// Every shader write so far can be read as indirect arguments.
+fn settle_arguments(list: &HostList) -> bool {
+    use windows::core::Interface;
+    let Ok(list) = list.list.cast::<ID3D12GraphicsCommandList7>() else {
+        return false;
+    };
+    let wait = D3D12_GLOBAL_BARRIER {
+        SyncBefore: D3D12_BARRIER_SYNC_ALL,
+        SyncAfter: D3D12_BARRIER_SYNC_EXECUTE_INDIRECT,
+        AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+        AccessAfter: D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT,
+    };
+    let group = D3D12_BARRIER_GROUP {
+        Type: D3D12_BARRIER_TYPE_GLOBAL,
+        NumBarriers: 1,
+        Anonymous: D3D12_BARRIER_GROUP_0 { pGlobalBarriers: &raw const wait },
+    };
+    // SAFETY: an open list; one global barrier that lives through the call.
+    unsafe { list.Barrier(&[group]) };
+    true
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -217,6 +281,9 @@ pub(crate) struct State {
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
+    /// Whether shader writes so far have been waited for as indirect
+    /// arguments in the host list ([`settle_arguments`]).
+    args_settled: bool,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -2032,6 +2099,7 @@ impl State {
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
+        self.args_settled = false;
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2336,6 +2404,7 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         self.window = None;
+        self.args_settled = false;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -2727,6 +2796,7 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
+        self.args_settled = false;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -2832,6 +2902,7 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
+        self.args_settled = false;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -2956,6 +3027,41 @@ impl State {
         // buffer. Anything else ends the window: it uses the scratch buffer
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
+        // Straight from the title's buffer (`direct_indirect`): one wait for
+        // the shader writes before, then draws with nothing between them.
+        const DIRECT_USE: usize = usize::MAX - 0x78;
+        let stores = p.stages.iter().any(|stage| stage.translated().stores);
+        if direct_indirect() && kind == MESH && max == 1 && count.is_none() && args.offset(arguments) % 4 == 0 {
+            args.refresh(list, arguments, len);
+            if list.first_use(DIRECT_USE) {
+                self.args_settled = false;
+            }
+            if !self.args_settled {
+                if !settle_arguments(list) {
+                    why("no enhanced barriers for indirect arguments");
+                    return false;
+                }
+                self.args_settled = true;
+            }
+            if !self.prepare_for(list, false, true) {
+                why("prepare failed");
+                return false;
+            }
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), false));
+            self.mesh_scissor(list, true);
+            // SAFETY: an open list with everything set; the host copy is kept
+            // alive by the list (its refresh), and the signature is cached.
+            unsafe {
+                list.list.ExecuteIndirect(&signature, 1, &args.buffer, args.offset(arguments), None, 0)
+            };
+            self.mesh_scissor(list, false);
+            if stores {
+                self.args_settled = false;
+            }
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         let offset = args.offset(arguments);
         let windowed = windows()
             && kind != DISPATCH
@@ -2966,6 +3072,7 @@ impl State {
         // reset) has another scratch buffer, or this one's with old bytes.
         if !windowed || list.first_use(WINDOW_USE) {
             self.window = None;
+        self.args_settled = false;
         }
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
         let hit = self
@@ -3015,6 +3122,7 @@ impl State {
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
+        self.args_settled = false;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };

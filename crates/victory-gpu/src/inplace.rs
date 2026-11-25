@@ -286,6 +286,8 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
+    // A handle used before: the mapping of what it was stays, unused.
+    BESIDE.lock().unwrap_or_else(|e| e.into_inner()).remove(&section);
     let mut v = views();
     v.sections.retain(|s| s.0 != section);
     v.sections.push((section, bytes, committed));
@@ -351,6 +353,33 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
         out.push((base, bytes));
     }
     out
+}
+
+/// Our own mappings of the title's sections, whole, by handle (0: refused).
+static BESIDE: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// The address in a mapping of ours of the physical bytes that the title's
+/// view shows at `[at, at + len)`; `None` if it is not one view's. Nothing is
+/// ever guarded there: a write through it changes the title's bytes and
+/// leaves the guards of the title's views as they are.
+pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
+    let (section, offset) = {
+        let v = views();
+        let (&base, &(bytes, section, offset)) = v.views.range(..=at).next_back()?;
+        let within = at - base;
+        if within.checked_add(len)? > bytes {
+            return None;
+        }
+        (section, offset + within as u64)
+    };
+    let mut maps = BESIDE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = *maps.entry(section).or_insert_with(|| {
+        // SAFETY: the runtime's section; the whole of it, mapped anew.
+        let view = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_READ | mem::FILE_MAP_WRITE, 0, 0, 0) };
+        tracing::info!(section, mapped = !view.Value.is_null(), "a section of the title's pages, mapped beside its views");
+        view.Value as usize
+    });
+    (map != 0).then(|| map + offset as usize)
 }
 
 /// The address of the 64 KiB page shown at `page` in every title view that
