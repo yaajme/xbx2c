@@ -155,7 +155,9 @@ const WINDOW_MOST: u64 = 64;
 /// apart after it (16, then twice as many each time, [`WINDOW_MOST`] at
 /// most, never past the buffer) into
 /// the list's scratch buffer in one pass, and the draws that follow read
-/// their record there with no pass of ours, until one of these: a compute
+/// their record there with no pass of ours and no barrier (the scratch
+/// buffer stays readable as arguments until the next clamp), until one of
+/// these: a compute
 /// dispatch, a direct draw, an indirect call with a count buffer or more
 /// than one record, a draw whose shaders can store to buffers, a record
 /// outside the window, another host list.
@@ -188,13 +190,13 @@ fn windows() -> bool {
 /// from the title's buffer (`VICTORY_INDIRECT_DIRECT=1`; off by default).
 ///
 /// The clamp (`crate::indirect::bound`) runs a compute pass before each of
-/// some 5,100 draws a frame, and the card goes from drawing to compute and
+/// some 5,100 calls a frame, and the card goes from drawing to compute and
 /// back for every one: on an RTX 4090 4.3 microseconds a draw against 0.01
 /// (`bare_command_cost`, (a) and (h)), with or without the waits around it.
 /// Here the draws have nothing between them; what shaders wrote is waited
 /// for once, after the commands that may write arguments.
 ///
-/// Mesh draws only (some 4,200 of them). Vertex draws keep the clamp: the
+/// Mesh draws only (3,842 of them where that was counted). Vertex draws keep the clamp: the
 /// tiled lighting takes its counts from compute programs that a card of
 /// 32-lane waves refuses, and unclamped garbage there hung the card at world
 /// load in three launches of eight (stopped in an `indirect kind 0`).
@@ -2147,6 +2149,36 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if self.ambient(list, p) {
+            // The pass bound its own.
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+            self.host_heaps = [0; 2];
+        }
+    }
+
+    /// After a dispatch of `p`: the constant in place of its output, if it is
+    /// the title's program that resolves indirect light (`crate::ambient`).
+    /// Whether anything was recorded.
+    fn ambient(&self, list: &HostList, p: &HostPipeline) -> bool {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+            return false;
+        };
+        let (slot, offset) = crate::ambient::LIGHT;
+        let used = stage.translated().used.iter().any(|u| {
+            u.kind == ResourceType::Uav && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+        });
+        let view = match self.roots_ref(true).get(usize::from(slot)) {
+            Some(Root::Table(table)) if used => crate::descriptor::view(table + u64::from(offset) * 4),
+            _ => None,
+        };
+        match view {
+            Some(View::Unordered(light, ..)) if light != 0 => crate::ambient::put(list, light as This),
+            view => {
+                once!(used, ?view, "no constant light: the resolve writes no texture of the title's where it is expected");
+                false
+            }
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -3080,9 +3112,25 @@ impl State {
             .as_ref()
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base));
+            .map(|w| (w.scratch.clone(), offset - w.base, w.step));
         let (bounded, at) = match hit {
-            Some(hit) => hit,
+            Some((scratch, at, step)) => {
+                // Diagnostics of windows: the record clamped again and
+                // compared (`crate::indirect::window_check`).
+                if crate::indirect::window_check()
+                    && crate::indirect::check_hit(
+                        list,
+                        (&args.buffer, offset),
+                        (kind, step),
+                        &scratch,
+                        at,
+                    )
+                {
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                }
+                (scratch, at)
+            }
             None => {
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
@@ -3147,7 +3195,6 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
             why("prepare failed");
             return false;
         }
@@ -3173,7 +3220,9 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
+        // The scratch buffer stays readable as arguments: the next draw of
+        // the window reads it with no barrier, and the next clamp moves it
+        // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

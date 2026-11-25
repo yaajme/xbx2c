@@ -1,70 +1,133 @@
 # xbx2c (Xbox SeriesX to CoreWin): a faster fork of victory-fork (work in progress)
 
-A fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork),
-which is itself a fork of [VIctory](https://github.com/Marvisak/VIctory). It
-adds frame-rate work on top of victory-fork `9376fd6`. **Everything added here
-is off by default**: without the switches below it behaves as victory-fork
-does. It is **not playable yet**.
+A fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork)
+(merged up to `f85101b`), which is itself a fork of
+[VIctory](https://github.com/Marvisak/VIctory). It adds frame-rate work and a
+few fixes. The frame-rate switches are off by default. It is **not playable
+yet**.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. Not affiliated with or endorsed by its developer or
 publisher.
 
-## What this fork adds
+> **The newest commit has not been run in the game.** It builds, and its tests
+> pass but for what is named below. If it misbehaves, try `-Safe`, or go back to
+> `b79832e` (which has the two faults named under "Fixed since `b79832e`").
 
-| Switch | What it does |
-|--------|--------------|
-| `VICTORY_INDIRECT_DIRECT=1` | GPU-driven **mesh** draws read their size straight from the title's buffer. The clamp ran a compute pass before each of some 3,800 of them a frame, and the card went from drawing to compute and back every time: 4.26 microseconds a draw on an RTX 4090 against 0.01 for a bare one (`bare_command_cost`). Vertex, indexed and compute calls keep the clamp |
-| `VICTORY_COPY_FETCH=1` | What shaders wrote comes back on a copy queue of its own instead of behind all the work on the main queue (fetch waits went from about 150 to 7 ms a frame; the frame gained less) |
-| `VICTORY_SAFE_COPY=1` | Title memory is read in place with the fault caught, in place of a `ReadProcessMemory` call for each of some 13,000 small copies a frame |
-| `VICTORY_FILL_FREE=1` | A small constant buffer does not wait for GPU work that only declared the whole heap around it |
-| `VICTORY_WRITE_BESIDE=1` | Shader results go into the title's memory through a second mapping, so the page stays guarded and the copy that made them is not copied, uploaded and hashed again (about 60 MB of 150 MB copied a frame was this echo) |
-| `VICTORY_SKIP_SAME=1` | Of a page found written, only the 4 KiB pieces that differ are taken and sent up (101 to 24 MB sent up a frame) |
-
-Always on: a bitmap for the guards' clean blocks, and one protection call for
-consecutive blocks. With 16 GB of card memory or more,
-`VICTORY_CARD_WINDOWS_MB=6144` and `VICTORY_CARD_BUFFERS_MB=4096` (victory-fork's
-own switches) keep more of the title's memory on the card.
-
-### Measured
-
-One machine (RTX 4090 24 GB, Ryzen 7 7800X3D, 32 GB RAM, Windows 11), one fixed
-view in the first gameplay room, about 4,900 draws, Series X profile. Single
-launches: a few milliseconds either way are noise.
-
-| | ms a frame | frames a second |
-|---|---|---|
-| victory-fork `9376fd6`, defaults (1 launch) | 207-228 | 4.4-4.8 |
-| this fork, all switches above (4 launches) | 105-125 | 8.0-9.6 |
-
-### Use
+## Use
 
 ```powershell
 cargo build --release -p victory
 powershell -ExecutionPolicy Bypass -File scripts\play-fast.ps1 -Exe "<game dir>\<the title's exe>"
 ```
 
-`-Safe` starts it with none of the switches; `-SmallCard` leaves out the two
-card-memory ones.
+| | |
+|---|---|
+| (nothing) | The switches in the first table |
+| `-Experimental` | Those and the ones in the second |
+| `-Ambient 0.6` | A constant in place of the missing indirect light |
+| `-SmallCard` | Without the two switches that want 16 GB of card memory |
+| `-Safe` | No switch at all |
+| `-Log run.log` | The log goes to a file |
 
-### Known risks and problems
+The first start after a new version translates the shaders again and takes
+longer. **Reporting a run**: which options, the card and driver, whether it
+reached the world, frames a second standing still (window title), what looked
+wrong, and the log. Close other games first: one running beside it took a
+quarter of the card's memory and half the frame rate here.
 
-- **A GPU hang is possible** with `VICTORY_INDIRECT_DIRECT=1`: mesh draws are no
-  longer bounded. An earlier form that also covered vertex draws hung the card
-  at world load in 3 launches of 8; those draws take their counts from compute
-  programs that a card of 32-lane waves refuses. With the mesh-only form: no
-  hang in 17 world loads (one to three minutes in the first room each, not all
-  of them with every switch on). Save your work before playing.
-- `VICTORY_FILL_FREE=1` lets a constant buffer be read before the GPU work that
-  might write it; none of some 1,800 reads looked at afterwards had changed,
-  which is evidence and not proof.
-- Tested at one spot in the game and on one NVIDIA card. Other places and AMD
-  cards are untested.
-- The picture is victory-fork's: shadows are black (no ray tracing), and blocky
-  patches remain at some edges.
+## Switches
 
-These changes were developed with [Claude Code](https://claude.com/claude-code).
-Everything below is victory-fork's own README, unchanged.
+Tried in the game (the copy queue is victory-fork's own, in place of this fork's
+earlier `VICTORY_COPY_FETCH`, which now selects it):
+
+| Switch | What it does |
+|--------|--------------|
+| `VICTORY_INDIRECT_DIRECT=1` | GPU-driven **mesh** draws read their size straight from the title's buffer. The clamp ran a compute pass before each of some 3,800 of them a frame: 4.26 microseconds a draw on an RTX 4090 against 0.01 for a bare one (`bare_command_cost`). Other indirect calls keep the clamp |
+| `VICTORY_QUEUE2=1` | victory-fork's: what shaders wrote comes back on a copy queue |
+| `VICTORY_SAFE_COPY=1` | Title memory is read in place with the fault caught, in place of a kernel call for each of some 13,000 small copies a frame |
+| `VICTORY_WRITE_BESIDE=1` | Shader results go into title memory through a second mapping, so that the page stays guarded and is not copied, uploaded and hashed again |
+| `VICTORY_SKIP_SAME=1` | Of a page found written, only the 4 KiB pieces that differ are taken and sent up (101 to 24 MB a frame) |
+
+With 16 GB of card memory or more, `VICTORY_CARD_WINDOWS_MB=6144` and
+`VICTORY_CARD_BUFFERS_MB=4096` (victory-fork's own) keep more on the card.
+
+Not tried in the game yet, or only in part (`-Experimental`):
+
+| Switch | What it does |
+|--------|--------------|
+| `VICTORY_MERGE_FINE=1` | The title's small changes under shader writes go up as one dispatch that writes exactly their bytes. At the cap of 512 runs the submitting thread waited for everything in the air (24 to 27 ms a frame) |
+| `VICTORY_GUARD_ONCE=1` | A submission asks the page guards once, not once for each copy |
+| `VICTORY_HEAP_SYNC_PAGES=1`, `VICTORY_SYNC_ASIDE=1` | Descriptor records copied as bytes: a page at a time, and on a thread of its own |
+| `VICTORY_WIDE_REFRESH=1` | victory-fork's: copies refreshed on several threads; here textures too |
+| `VICTORY_BURY_THREAD=1` | What is let go is freed on a thread of its own |
+| `VICTORY_WIDE_HASH=1`, `VICTORY_CARD_REHASH_RUNS=1` | Page hashes on the card by 64 lanes, and (victory-fork's) joined |
+| `VICTORY_ASYNC_SUBMIT=1`, `VICTORY_TEXTURE_NO_WAIT=1` | victory-fork's |
+| `VICTORY_AMBIENT=0.6` (`-Ambient 0.6`) | The indirect light, which needs rays that do not run, is a constant. By beloooo ([Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)) |
+
+## Always on
+
+- **Fix: a title write could be undone.** The copy-back put a whole stretch of
+  memory back, with title bytes read a moment before; a write landing between
+  was lost. Only the words the card wrote are put back now. The fault is in
+  victory-fork's default path; a test shows it
+  (`warp_small_title_writes_under_shader_writes_reach_their_round`).
+- Pixel shaders: a helper lane's `v_readfirstlane` reads its own value (upstream
+  `0601955`); a quad is read through quad reads (beloooo, `03629f3`).
+- Mesh primitives: edge flags are no part of the index (upstream `c0228d9`).
+- Upstream `40f30be`, `7d04943`, `c3a04e2`, `e45bacd`, `97c8783`, `4e155a3`,
+  `be3202d`.
+- The guards' clean blocks as a bitmap, one protection call for consecutive
+  blocks, readers of the heap table beside each other, one barrier for a
+  submission's uploads.
+
+## Fixed since `b79832e`
+
+- `VICTORY_WRITE_BESIDE=1` kept its mapping of a section after the title freed
+  it: the memory stayed, and a handle used again could have sent writes to
+  another section.
+- `VICTORY_COPY_FETCH=1` could miss what a later flight wrote to a piece fetched
+  beside it.
+
+Both were off by default, and on with `play-fast.ps1`.
+
+## Measured
+
+One machine (RTX 4090 24 GB, Ryzen 7 7800X3D, 32 GB RAM, Windows 11), one fixed
+view in the first gameplay room, about 4,900 draws, Series X profile. A few
+milliseconds either way are noise. **Not of the newest commit.**
+
+| | ms a frame | frames a second |
+|---|---|---|
+| victory-fork `9376fd6`, defaults (1 launch) | 207-228 | 4.4-4.8 |
+| this fork `b79832e`, its switches (4 launches) | 105-125 | 8.0-9.6 |
+
+A later build with most of the experimental switches ran at 100-107 ms with a
+profiler on (1 launch). About 15 GB of card memory and 16 GB of RAM were in use.
+
+## Known risks and problems
+
+- **A GPU hang is possible** with `VICTORY_INDIRECT_DIRECT=1`: mesh draws are not
+  bounded. A form that also covered vertex draws hung the card at world load in
+  3 launches of 8. With the mesh-only form there was no hang in 17 logged world
+  loads up to `b79832e`, all in the first room, not all with every switch on.
+  Save your work before playing.
+- The sky showed colour banding in one run, with another game starting beside
+  it; the cause is not known.
+- Tested at one spot, on one NVIDIA card. AMD cards are untested.
+- Shadows are black without `-Ambient` (no ray tracing); blocky patches remain
+  at some edges.
+- Tests: two of `victory-shader`'s rectangle tests fail, as in victory-fork; in
+  `victory-gpu` one test of the in-place path fails now and then, and a run
+  crashes now and then (seen in victory-fork too; cause not known).
+
+## Credits
+
+fxceless (victory-fork), Marvisak and contributors (VIctory), beloooo, moe-miau
+and the authors of the upstream commits named above, and everyone credited
+below. Licensed GPL-3.0-or-later, as VIctory is. These changes were developed
+with [Claude Code](https://claude.com/claude-code). Everything below is
+victory-fork's own README, unchanged.
 
 ---
 
@@ -149,10 +212,45 @@ What did it, on top of the list below:
   0 here, but the card got busier, so no gain is claimed yet). The frame is
   still 250 to 380 ms: the card is the limit now, most of it the
   per-record clamp before each of some 6,700 indirect draws a frame.
-- Tried and NOT in this tree: pull request #220 (cheaper indirect draws)
-  with `VICTORY_INDIRECT_WINDOW=1` cut the card's time from about 100-150
-  to 35-80 ms a frame here, and lost the device twice (once with a page
-  fault on the card after 160 s). Do not turn windows on with it yet.
+- Pull request #220 (cheaper indirect draws) is IN this tree now, its
+  windows off by default (`VICTORY_INDIRECT_WINDOW=1`). History, so nobody
+  repeats it: with windows on it lost the device three times here. Its own
+  checker (`VICTORY_INDIRECT_WINDOW_CHECK=1`) then showed one list drawing
+  90 records of 2^24 vertices from a window, where the per-draw path lets
+  eight through; a record of 2^23 vertices an instance or more now runs
+  empty. Since that fix: five runs with windows on, no device loss, the
+  card's time per frame roughly halved. One loss after the fix had the
+  in-flight fetch (#648) on as well; do not combine the two. The in-flight
+  fetch itself measured slower here in two runs and stays off.
+- Frame rate, second night (an RTX 4070; the first room went from about
+  3.5-4 to 6-7 frames a second with ALL of the switches below; the
+  defaults are unchanged and give about 4.5-5):
+  - `VICTORY_ASYNC_SUBMIT=1`: submissions are prepared and sent by a
+    thread of the layer, not by the title's render thread, which a
+    profile showed inside the submit path for 257 of 292 ms a frame.
+  - `VICTORY_QUEUE2=1`: fetches of what shaders wrote go to a copy queue
+    (brought back, with the fix for a piece fetched beside a later
+    flight); the copy-back thread's wait fell from about 125 to 7 ms a
+    frame.
+  - `VICTORY_INDIRECT_WINDOW=1`: see above.
+  - `VICTORY_TEXTURE_NO_WAIT=1`: a texture refresh no longer waits while
+    the title remaps memory; the loading phase had 5 readings over a
+    second where it had 18.
+  - `VICTORY_MERGE_GAP=64 VICTORY_MERGE_RUNS=4096`: title bytes put in
+    under flights' shader writes are joined over small gaps (NOT exact:
+    read the comment at `merge_gap` before using it).
+  - On by default: fills of upload memory and read-only buffer copies no
+    longer wait for flights and are checked against what the flights then
+    wrote (`VICTORY_FILL_WAIT=1` waits as before; no mismatch in any run
+    so far); up to 512 idle host lists and texture staging buffers are
+    reused instead of made and freed every frame.
+  - `VICTORY_PROFILE=1` (diagnostics builds): a sampling profiler inside
+    the layer; it is how the above was found.
+  Still open: the frame rate dips (5-second readings of 300-500 ms among
+  150-215); in some of them texture uploads are 3-5 times the usual, in
+  others nothing logged stands out. Not shader compiles (checked: 4-9
+  first uses and no waiting in those readings). A per-frame logger is the
+  next step.
 - Known and counted, not fixed yet: an indirect compute pass asks for
   about 77,500 thread groups in x where one dispatch runs 65,535 (the
   rest is cut off).

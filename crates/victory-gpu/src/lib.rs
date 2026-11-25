@@ -38,8 +38,12 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod profile;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod queue2;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -50,6 +54,10 @@ pub mod shader_cache;
 mod memory;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
+mod fine;
 #[cfg(windows)]
 mod safe_copy;
 #[cfg(windows)]
@@ -63,7 +71,7 @@ mod watch;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
     title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,

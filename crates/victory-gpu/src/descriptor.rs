@@ -126,12 +126,15 @@ const SHADER_VISIBLE: u32 = 1;
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
 /// start, end, heap.
 #[cfg(windows)]
-static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+// (Read by every view the title writes, and by [`sync_heaps`] for all of its
+// pass, 8 ms a frame: as a plain lock the threads that record stood for it.
+// No reader asks again while it reads.)
+static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
 
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
 fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let &(_, _, at) = heaps
         .iter()
         .find(|&&(start, end, _)| (start..end).contains(&handle))?;
@@ -178,7 +181,7 @@ pub(crate) fn sync_heaps() {
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -203,6 +206,12 @@ pub(crate) fn sync_heaps() {
                 if crate::host::read_into(from as *const u8, &mut page_bytes) {
                     pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                    if host::sync_pages() {
+                        looked += slots.end - slots.start;
+                        mirrored += host.mirror_copied_page(slots, start, step, from, &page_bytes);
+                        page += crate::watch::PAGE;
+                        continue;
+                    }
                     for index in slots {
                         let handle = start + index * step;
                         // A record that straddles the range's ends is left
@@ -228,6 +237,77 @@ pub(crate) fn sync_heaps() {
     drop(heaps);
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
+    }
+}
+
+/// [`sync_heaps`] begun on a thread of its own and not waited for yet
+/// ([`sync_heaps_aside`]): dropping this waits.
+#[cfg(windows)]
+pub(crate) struct Syncing(());
+
+/// Passes asked for, and done.
+#[cfg(windows)]
+static ASIDE: (std::sync::Mutex<(u64, u64)>, std::sync::Condvar) =
+    (std::sync::Mutex::new((0, 0)), std::sync::Condvar::new());
+
+/// Whether [`sync_heaps_aside`] is on (and its thread there).
+#[cfg(windows)]
+pub(crate) fn syncs_aside() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_SYNC_ASIDE").is_some_and(|v| v == "1")
+            && std::thread::Builder::new().name("victory-sync".into()).spawn(syncs).is_ok()
+    })
+}
+
+/// Begins [`sync_heaps`] beside the thread that submits, which prepares the
+/// rest of its submission meanwhile (`VICTORY_SYNC_ASIDE=1`; off by default:
+/// `None`, and nothing begun). 8 of that thread's 80 ms a frame; nothing it
+/// prepares reads a descriptor, only the lists do, which wait for it.
+#[cfg(windows)]
+pub(crate) fn sync_heaps_aside() -> Option<Syncing> {
+    syncs_aside().then(|| {
+        ASIDE.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
+        ASIDE.1.notify_all();
+        Syncing(())
+    })
+}
+
+#[cfg(windows)]
+impl Drop for Syncing {
+    fn drop(&mut self) {
+        let mut passes = ASIDE.0.lock().unwrap_or_else(|e| e.into_inner());
+        while passes.1 < passes.0 {
+            passes = ASIDE.1.wait(passes).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// The thread of [`sync_heaps_aside`].
+#[cfg(windows)]
+fn syncs() {
+    /// The pass is done, also if it panicked: its waiter goes on.
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            let mut passes = ASIDE.0.lock().unwrap_or_else(|e| e.into_inner());
+            // (One submission at a time asks, and waits for its pass.)
+            passes.1 = passes.0;
+            ASIDE.1.notify_all();
+        }
+    }
+    loop {
+        {
+            let mut passes = ASIDE.0.lock().unwrap_or_else(|e| e.into_inner());
+            while passes.1 >= passes.0 {
+                passes = ASIDE.1.wait(passes).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        let done = Done;
+        if std::panic::catch_unwind(sync_heaps).is_err() {
+            tracing::error!("the pass over descriptors copied as bytes panicked");
+        }
+        drop(done);
     }
 }
 
@@ -277,7 +357,7 @@ fn changed_slots(
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
@@ -290,7 +370,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
     }
 }
@@ -1096,7 +1176,7 @@ pub(crate) extern "system" fn create_heap(
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.push((start, start + size, at));
     }
     #[cfg(not(windows))]

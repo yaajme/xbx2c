@@ -99,6 +99,8 @@ struct Card {
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
     sent: Mutex<Vec<(usize, usize, u64)>>,
+    /// Small changes of the title's under shader writes (`crate::fine`).
+    fine: crate::fine::Fine,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -367,8 +369,10 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// that send knows the card did not hold these bytes yet
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
-pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+#[allow(clippy::type_complexity)]
+pub(crate) fn card_dirty(sent_as: u64) -> (Vec<(Arc<Shadow>, Vec<(usize, usize)>)>, Vec<(Arc<Shadow>, crate::fine::Bytes)>) {
     let mut out = Vec::new();
+    let mut small = Vec::new();
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
     carded.retain(|weak| {
@@ -389,12 +393,21 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
                 ranges
             })
             .unwrap_or_default();
-        if !ranges.is_empty() {
+        // (A copy with small changes only is in both lists, with no ranges.)
+        let fine = match &shadow.card {
+            Some(card) if crate::fine::on() => card.fine.take(sent_as, fetched, relay()),
+            _ => Default::default(),
+        };
+        let has_fine = !fine.is_empty();
+        if has_fine {
+            small.push((shadow.clone(), fine));
+        }
+        if !ranges.is_empty() || has_fine {
             out.push((shadow, joined(ranges)));
         }
         true
     });
-    out
+    (out, small)
 }
 
 /// Ranges in order, those that overlap or touch as one.
@@ -1805,6 +1818,46 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
+/// `runs` (in order) with those a gap of `gap` bytes or fewer apart made
+/// one run, the gap's bytes included.
+fn joined_over(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
+    if gap == 0 || runs.len() < 2 {
+        return runs;
+    }
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for (at, n) in runs {
+        match out.last_mut() {
+            Some(last) if at - (last.0 + last.1) <= gap => last.1 = at + n - last.0,
+            _ => out.push((at, n)),
+        }
+    }
+    out
+}
+
+/// The gap, in bytes, over which the title bytes put into a copy in the
+/// card's memory under flights' shader writes are joined into one run
+/// (`VICTORY_MERGE_GAP`, 0 to 64; 0 by default: only the bytes the title
+/// changed go up, as before).
+///
+/// Run 219: the title rewrites some hundred pages of its big buffer a
+/// frame while flights that may write that buffer are in the air, and
+/// byte by byte the new content differs from the old in 38,000 runs a
+/// frame (equal bytes in between, mostly zeros), far over the 512 runs a
+/// submission may send, so the flights were settled twice a frame, 50 ms
+/// of the submitting thread. Joined over small gaps the same pages are a
+/// few runs.
+///
+/// What it gives up: a gap byte is equal in title memory and on the CPU
+/// side of the copy, and goes up with its run. If a flight in the air
+/// wrote exactly that byte on the card (a shader store within `gap` bytes
+/// between two bytes the title changed in the same frame), the store is
+/// overwritten with the old value, and no compare finds it. Exact (0) is
+/// the default for that reason.
+fn merge_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| std::env::var("VICTORY_MERGE_GAP").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(0, |n| n.min(64)))
+}
+
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
@@ -2543,6 +2596,7 @@ impl Shadow {
                     continue;
                 };
                 let at = at + first;
+                crate::host::shaders_write(start + at, &title[..n.min(title.len())]);
                 crate::watch::writing(start + at, n);
                 // Only the GPU's bytes (upstream #2009): the rest of the
                 // stretch is the title's as read, and a title write landing
@@ -2636,12 +2690,18 @@ impl Shadow {
         // The stretch as read: what the card did not change is the
         // title's, and may have been written again since.
         let as_read = merge_race_on().then(|| title.clone());
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        word_runs(start + at, held, now, |off, len| runs.push((off, len)));
         if !merge_piece(now, held, title) {
             return 0;
         }
+        crate::host::shaders_write(start + at, &title[..]);
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        // Only the card's words, as in `card_merge_relay`.
+        for &(off, len) in &runs {
+            crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
+        }
         n
     }
 
@@ -2894,7 +2954,14 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = changed_runs(title, held);
+                    let mut runs = Vec::new();
+                    if let Some(card) = self.card.as_ref().filter(|_| crate::fine::on()) {
+                        let bytes = card.fine.merge(at, title, held);
+                        MERGED[1].fetch_add(u64::from(bytes > 0), Ordering::Relaxed);
+                        MERGED[2].fetch_add(bytes as u64, Ordering::Relaxed);
+                    } else {
+                        runs = joined_over(changed_runs(title, held), merge_gap());
+                    }
                     if runs.len() > *runs_left {
                         return true;
                     }
@@ -3217,6 +3284,17 @@ impl Shadow {
         }
     }
 
+    /// The word at offset `at` (a multiple of 4) of the CPU's side.
+    pub(crate) fn card_word(&self, at: usize) -> u32 {
+        match &self.card {
+            // SAFETY: inside the mapping; the thread that lands flights may
+            // write other bytes of the word meanwhile, which the caller's
+            // mask leaves out.
+            Some(card) if at as u64 + 4 <= card.size => unsafe { self.data.add(at).cast::<u32>().read_volatile() },
+            _ => 0,
+        }
+    }
+
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
     /// card side's bytes from before if made yet, and their size.
     pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
@@ -3340,6 +3418,7 @@ impl Shadow {
                 *o = merged;
             }
             if differs != 0 {
+                crate::host::shaders_write(start + at, &title[..]);
                 crate::watch::writing(start + at, n);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
@@ -3393,7 +3472,7 @@ impl Shadow {
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
-        let skip: Vec<(usize, usize)> = {
+        let mut skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
             dirty
@@ -3403,6 +3482,7 @@ impl Shadow {
                 .filter(|&(a, b)| a < at + n && b > at)
                 .collect()
         };
+        card.fine.newer(at, at + n, fetched_after, &mut skip);
         title.clear();
         title.resize(n, 0);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
@@ -3410,8 +3490,11 @@ impl Shadow {
         // title's, and may have been written again since.
         let as_read = (mapped && merge_race_on()).then(|| title.clone());
         let mut changed = false;
+        // The words the card wrote, as (offset, bytes) of the stretch.
+        let mut runs: Vec<(usize, usize)> = Vec::new();
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
+            word_runs(start + at + a, &held[a..b], &gpu[a..b], |off, len| runs.push((a + off, len)));
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
             changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
@@ -3419,6 +3502,7 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
+        crate::host::shaders_write(start + at, &title[..]);
         if crate::watch::beside_on()
             && let Some((before, now)) = crate::watch::write_beside(start + at, title.as_ptr(), n)
         {
@@ -3439,7 +3523,13 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        // Only those: the rest of the stretch is the title's as it was read,
+        // and a write of the title's landing there since stays (written back
+        // whole, it was undone: a shader then read the value before it).
+        // (Beside the guards, above, the page is known not written since.)
+        for &(off, len) in &runs {
+            crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
+        }
         #[cfg(feature = "diagnostics")]
         echo_ours(self.id, start + at, n);
         n
@@ -3605,6 +3695,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
+                fine: Default::default(),
                     size,
                 };
                 (on_card, Some(card))
@@ -3821,6 +3912,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                fine: Default::default(),
                 size: len,
             };
             (on_card, Some(card))
@@ -4100,6 +4192,7 @@ mod card_merge_tests {
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
+            fine: Default::default(),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
             });

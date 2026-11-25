@@ -47,7 +47,7 @@ impl StaticSampler {
             _ => 0,
         };
         let filter = if mag >= 2 || min >= 2 {
-            0x55 | reduction << 7
+            0x54 | u32::from(mip == 2) | reduction << 7
         } else {
             (min & 1) << 4 | (mag & 1) << 2 | u32::from(mip == 2) | reduction << 7
         };
@@ -121,5 +121,23 @@ mod tests {
             ),
             (0x1D5, 16, 15.0)
         );
+    }
+
+    #[test]
+    fn anisotropic_samplers_preserve_mip_point_filtering() {
+        for (reduction, base) in [(0u32, 0x54u32), (1, 0x154), (2, 0x1D4)] {
+            let w0 = reduction << 29;
+            for mip in [0u32, 1] {
+                let w2 = (mip << 26) | 0x00F0_0000; // mag = 3, min = 3
+                let s = StaticSampler::from_words([w0, 0x00FF_F000, w2, 0]);
+                assert_eq!(s.filter, base, "reduction={reduction} mip={mip}");
+            }
+            let w2 = (2 << 26) | 0x00F0_0000; // mip = 2 (linear)
+            let s = StaticSampler::from_words([w0, 0x00FF_F000, w2, 0]);
+            assert_eq!(s.filter, base | 1, "reduction={reduction} mip=2");
+        }
+        // Mixed anisotropic mag (2) with linear min (1) and point mip (1).
+        let mixed = StaticSampler::from_words([0, 0, (1 << 26) | (1 << 22) | (2 << 20), 0]);
+        assert_eq!(mixed.filter, 0x54);
     }
 }

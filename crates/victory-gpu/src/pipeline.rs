@@ -61,6 +61,9 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// The title's program that resolves its indirect light (`crate::ambient`).
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -111,6 +114,9 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
+                #[cfg(windows)]
+                resolves_light: crate::ambient::level().is_some()
+                    && bytes.windows(crate::ambient::PROGRAM.len()).any(|w| w == crate::ambient::PROGRAM),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })

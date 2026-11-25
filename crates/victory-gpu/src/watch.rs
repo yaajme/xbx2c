@@ -193,11 +193,29 @@ pub(crate) fn once() -> bool {
 /// refresh) as [`ask_ahead`] does, and lets that asking stand until
 /// [`ask_once_end`].
 pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
-    if !once() {
-        return;
+    if once() {
+        ask_once_of(ranges, guard_once());
     }
+}
+
+/// [`ask_once`]; `guarded`: of the guards too.
+fn ask_once_of(ranges: &[(usize, usize)], guarded: bool) {
     ask_once_end();
-    ask_ahead(ranges);
+    // With the guards asked too: view memory they hold is not put to the
+    // kernel, whose call only fails there (and is made again by halves).
+    let views: Vec<bool> = if guarded && !view_ask() {
+        let g = guards();
+        ranges
+            .iter()
+            .map(|r| g.protected.contains(&(r.0 / BLOCK)) || g.absent.contains(&(r.0 / BLOCK)))
+            .collect()
+    } else {
+        vec![false; ranges.len()]
+    };
+    let watched: Vec<(usize, usize)> = ranges.iter().zip(&views).filter(|(_, view)| !**view).map(|(r, _)| *r).collect();
+    ask_ahead(&watched);
+    // Uncommitted memory found by this asking: not asked about again in it.
+    let mut holes: Vec<(usize, usize)> = Vec::new();
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     if j.ahead.is_empty() {
@@ -210,16 +228,43 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
-    for &(start, end) in ranges {
+    for (&(start, end), &view) in ranges.iter().zip(&views) {
         if start >= end {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
+        if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            continue;
+        }
+        if (!view && ask_kernel(j, first, last)) || (guarded && ask_guards(j, first, last, &mut holes)) {
             j.ahead.push((first, last));
         }
     }
     j.kept = !j.ahead.is_empty();
+}
+
+/// Whether a submission's one asking ([`ask_once`]) asks the guards too
+/// (`VICTORY_GUARD_ONCE=1`; off by default). Nearly all a submission refreshes
+/// is view memory, which the kernel does not watch: 2,005 of 2,316 askings a
+/// frame went to the guards one by one.
+pub(crate) fn guard_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// [`ask_kernel`] of the guards, for view memory they hold already.
+fn ask_guards(j: &mut Journal, first: usize, last: usize, holes: &mut Vec<(usize, usize)>) -> bool {
+    if !known_view(first * PAGE) {
+        return false;
+    }
+    let Some(written) = guard_with(first * PAGE, last * PAGE, holes) else {
+        return false;
+    };
+    let now = j.ahead_asked;
+    for page in written {
+        j.written.insert(page, now);
+    }
+    true
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -250,6 +295,19 @@ pub(crate) fn wrote(at: usize, len: usize) {
     j.ahead_asked = now;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         j.written.insert(page, now);
+        // The guards are not asked again in this submission: the page's
+        // other views learn of it here (the guards' own note that it has
+        // any went when the copy opened them).
+        if guard_once() {
+            // (Not of the page the title shows wherever it has nothing:
+            // thousands of views, each guarded by itself.)
+            let shown = crate::inplace::pages_of(page * PAGE);
+            if shown.len() <= MANY_VIEWS {
+                for alias in shown {
+                    j.written.insert(alias / PAGE, now);
+                }
+            }
+        }
     }
 }
 
@@ -456,18 +514,22 @@ const BLOCK: usize = PAGE;
 /// watch about it can only fail. `VICTORY_VIEW_ASK=1` (or
 /// `VICTORY_GUARD_ASK=1`) asks the kernel anyway, as before.
 fn known_view(start: usize) -> bool {
-    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let ask = *ASK.get_or_init(|| {
-        ["VICTORY_VIEW_ASK", "VICTORY_GUARD_ASK"]
-            .iter()
-            .any(|n| std::env::var_os(n).is_some_and(|v| v == "1"))
-    });
-    if ask {
+    if view_ask() {
         return false;
     }
     let g = guards();
     let first = start / BLOCK;
     g.protected.contains(&first) || g.absent.contains(&first)
+}
+
+/// Whether the kernel is asked about view memory too ([`known_view`]).
+fn view_ask() -> bool {
+    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ASK.get_or_init(|| {
+        ["VICTORY_VIEW_ASK", "VICTORY_GUARD_ASK"]
+            .iter()
+            .any(|n| std::env::var_os(n).is_some_and(|v| v == "1"))
+    })
 }
 
 /// A set of blocks as words of 64, so that a long range nearly all in the
@@ -558,6 +620,12 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    guard_with(start, end, &mut Vec::new())
+}
+
+/// [`guard`]; `holes`: uncommitted blocks (first, end) other ranges of the
+/// same asking came upon, and those this one does.
+fn guard_with(start: usize, end: usize, holes: &mut Vec<(usize, usize)>) -> Option<Vec<usize>> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -595,7 +663,16 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             // Ordinary commits need no runtime mapping notification. Reuse
             // this asking's query for the following blocks in the same region.
             if block >= uncommitted_until {
-                uncommitted_until = uncommitted_end(block);
+                uncommitted_until = match holes.iter().find(|h| h.0 <= block && block < h.1) {
+                    Some(hole) => hole.1,
+                    None => {
+                        let end = uncommitted_end(block);
+                        if end > block {
+                            holes.push((block, end));
+                        }
+                        end
+                    }
+                };
             }
             open = block >= uncommitted_until;
             if open {
@@ -899,11 +976,7 @@ pub(crate) fn write_beside(at: usize, from: *const u8, len: usize) -> Option<(u6
         BESIDE[1].fetch_add(1, Relaxed);
         return None;
     }
-    let Some(to) = crate::inplace::beside(at, len) else {
-        BESIDE[1].fetch_add(1, Relaxed);
-        return None;
-    };
-    if !crate::host::write_kernel(to as *mut u8, from, len) {
+    if !crate::inplace::write_beside(at, from, len) {
         BESIDE[1].fetch_add(1, Relaxed);
         return None;
     }
@@ -915,13 +988,20 @@ pub(crate) fn write_beside(at: usize, from: *const u8, len: usize) -> Option<(u6
             }
         }
     }
+    let before_beside = j.written.get(&page).copied();
     j.asked += 1;
     let now = j.asked;
     // As in `wrote`: the asking that stands moves with it.
     if !j.ahead.is_empty() {
         j.ahead_asked = now;
     }
-    let before = j.written.insert(page, now).unwrap_or(0);
+    if guard_once() && !j.ahead.is_empty() && g.aliased.contains(&page) {
+        for alias in crate::inplace::pages_of(page * PAGE) {
+            j.written.insert(alias / BLOCK, now);
+        }
+    }
+    let before = before_beside.unwrap_or(0);
+    j.written.insert(page, now);
     BESIDE[0].fetch_add(1, Relaxed);
     Some((before, now))
 }
@@ -1219,6 +1299,44 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// With the guards asked too, a submission's one asking answers for a
+    /// view: what was written before it, not what is written after it, and
+    /// the next asking has that.
+    #[test]
+    fn one_asking_answers_for_guarded_views() {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        // SAFETY: a pagefile section of four blocks, mapped read-write (and
+        // left so).
+        let view = unsafe {
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (4 * BLOCK) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 4 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        let (start, end) = (view, view + 4 * BLOCK);
+        let first = view / PAGE;
+        // Taken once: all of it, and guarded.
+        let (taken, all) = writes(start, end, true).expect("a view");
+        assert_eq!(all.iter().map(|w| w.0).collect::<Vec<_>>(), (first..first + 4).collect::<Vec<_>>());
+        let newer = |pages: &[(usize, u64)], than: u64| -> Vec<usize> { pages.iter().filter(|w| w.1 > than).map(|w| w.0 - first).collect() };
+        // SAFETY (each): our view; the guard's handler gives the block back.
+        let write = |block: usize| unsafe { ((view + block * BLOCK + 8) as *mut u8).write_volatile(block as u8 + 1) };
+        write(1);
+        ask_once_of(&[(start, end)], true);
+        let (now, pages) = asked(start, end).expect("asked of the guards");
+        assert_eq!(newer(&pages, taken), [1]);
+        // Written after the asking: not in it, whoever looks.
+        write(2);
+        let (again, pages) = writes(start, end, true).expect("a view");
+        assert_eq!((again, newer(&pages, taken)), (now, vec![1]));
+        // The next one has it, and only it.
+        ask_once_of(&[(start, end)], true);
+        let (_, pages) = asked(start, end).expect("asked of the guards");
+        assert_eq!(newer(&pages, now), [2]);
+        ask_once_end();
     }
 
     /// A kernel read into a guarded view block fails; opened first, it

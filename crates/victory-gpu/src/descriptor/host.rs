@@ -1850,6 +1850,45 @@ impl HostHeap {
         true
     }
 
+    /// [`HostHeap::mirror_copied`] for title slots `slots` of the heap at
+    /// `start`, whose records lie in `bytes`, read from `from` on: under one
+    /// lock, and the new ones mirrored after it. How many were.
+    pub(crate) fn mirror_copied_page(&self, slots: std::ops::Range<u64>, start: u64, step: u64, from: usize, bytes: &[u8]) -> u64 {
+        let frame = crate::frame::current();
+        let tables = sync_tables();
+        let mut tabled = 0;
+        let mut new: Vec<u32> = Vec::new();
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if copied.is_empty() {
+                copied.resize(self.count as usize, 0);
+            }
+            for index in slots {
+                let Some(at) = ((start + index * step) as usize).checked_sub(from) else {
+                    continue;
+                };
+                let Some(record) = bytes.get(at..at + step as usize) else {
+                    continue;
+                };
+                let Some(last) = copied.get_mut(index as usize) else {
+                    continue;
+                };
+                if !tables && self.tabled_lately(index as u32, frame) {
+                    tabled += 1;
+                    continue;
+                }
+                if print_is_new(last, record) {
+                    new.push(index as u32);
+                }
+            }
+        }
+        COPIED_TABLED.fetch_add(tabled, std::sync::atomic::Ordering::Relaxed);
+        for &index in &new {
+            self.mirror(index, start + u64::from(index) * step, false);
+        }
+        new.len() as u64
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
@@ -2186,6 +2225,24 @@ fn record_print(record: &[u8]) -> u64 {
         h = (h ^ u64::from(b)).wrapping_mul(K);
     }
     h ^ (h >> 32)
+}
+
+/// Whether `record` is not the one whose print is `last`, which then is its.
+fn print_is_new(last: &mut u64, record: &[u8]) -> bool {
+    let print = record_print(record) | 1;
+    // A slot never looked at that holds nothing: as it was.
+    if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+        return false;
+    }
+    *last = print;
+    true
+}
+
+/// Whether the pass over records copied as bytes takes a page's records
+/// together (`VICTORY_HEAP_SYNC_PAGES=1`; off by default: a lock a record).
+pub(crate) fn sync_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_PAGES").is_some_and(|v| v == "1"))
 }
 
 /// Whether a buffer view off its buffer's elements gets a copy of its own

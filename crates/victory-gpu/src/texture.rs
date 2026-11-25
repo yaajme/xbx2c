@@ -69,6 +69,62 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
+    /// The size of the buffer if it came from the pool of spare staging
+    /// buffers and goes back to it ([`staging_buffer`]); 0: a buffer of its
+    /// own, released when this is dropped.
+    pooled: u64,
+}
+
+/// A staging buffer nothing holds: the buffer and where it is mapped.
+struct Spare(ID3D12Resource, usize);
+
+// SAFETY: a D3D12 buffer and its mapping, touched by nobody while it is
+// spare.
+unsafe impl Send for Spare {}
+
+/// Spare staging buffers by size (a power of two), and their bytes in all.
+static SPARE: Mutex<(std::collections::BTreeMap<u64, Vec<Spare>>, u64)> =
+    Mutex::new((std::collections::BTreeMap::new(), 0));
+/// The most bytes kept spare, and the largest buffer that is pooled.
+const SPARE_MOST: (u64, u64) = (256 << 20, 8 << 20);
+/// Staging buffers taken from the spare ones, and made, since the start.
+pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A mapped upload buffer of `total` bytes for a texture's staging, all
+/// zeros, and its pool size (0: not pooled).
+///
+/// Every texture the title streams in got a buffer of its own from the
+/// host and gave it back when its staging went: about a quarter of a
+/// millisecond to make (run 213's profile: 25 ms a frame on the recording
+/// threads for some 100 uploads, most of it the graphics kernel waiting)
+/// and more to free on the thread that submits. A streaming burst is 200
+/// to 500 uploads in a frame (run 222), and those are the frames that
+/// dip. Buffers of up to 8 MiB are now kept by size and used again,
+/// zeroed as a new one is (levels not there yet must read as zeros).
+/// `VICTORY_STAGING_POOL=0`: made and freed each time, as before.
+fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let size = total.max(64 << 10).next_power_of_two();
+    if size > SPARE_MOST.1 || !*ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0")) {
+        return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0));
+    }
+    let spare = {
+        let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = all.0.get_mut(&size).and_then(Vec::pop);
+        if taken.is_some() {
+            all.1 -= size;
+        }
+        taken
+    };
+    if let Some(Spare(buffer, data)) = spare {
+        SPARE_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: the buffer's own mapping, `size` bytes, which nothing
+        // else holds.
+        unsafe { std::ptr::write_bytes(data as *mut u8, 0, total as usize) };
+        return Some((buffer, data as *mut u8, size));
+    }
+    SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    host.upload_buffer(size).map(|(buffer, data)| (buffer, data, size))
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -401,6 +457,15 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // Nothing holds the staging any more (lists keep it until they are
+        // reset, after their submission has run): its buffer is spare.
+        if self.pooled != 0 {
+            let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            if all.1 + self.pooled <= SPARE_MOST.0 {
+                all.1 += self.pooled;
+                all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
+            }
+        }
     }
 }
 
@@ -1395,7 +1460,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let (buffer, data, pooled) = staging_buffer(host, total)?;
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1424,6 +1489,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        pooled,
     });
     map.insert(resource as usize, s.clone());
     Some(s)
