@@ -1,3 +1,73 @@
+# xbx2c: a faster fork of victory-fork (work in progress)
+
+A fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork),
+which is itself a fork of [VIctory](https://github.com/Marvisak/VIctory). It
+adds frame-rate work on top of victory-fork `9376fd6`. **Everything added here
+is off by default**: without the switches below it behaves as victory-fork
+does. It is **not playable yet**.
+
+**This repository contains no game files, code or assets.** You need your own
+copy of the game. Not affiliated with or endorsed by its developer or
+publisher.
+
+## What this fork adds
+
+| Switch | What it does |
+|--------|--------------|
+| `VICTORY_INDIRECT_DIRECT=1` | GPU-driven **mesh** draws read their size straight from the title's buffer. The clamp ran a compute pass before each of some 3,800 of them a frame, and the card went from drawing to compute and back every time: 4.26 microseconds a draw on an RTX 4090 against 0.01 for a bare one (`bare_command_cost`). Vertex, indexed and compute calls keep the clamp |
+| `VICTORY_COPY_FETCH=1` | What shaders wrote comes back on a copy queue of its own instead of behind all the work on the main queue (fetch waits went from about 150 to 7 ms a frame; the frame gained less) |
+| `VICTORY_SAFE_COPY=1` | Title memory is read in place with the fault caught, in place of a `ReadProcessMemory` call for each of some 13,000 small copies a frame |
+| `VICTORY_FILL_FREE=1` | A small constant buffer does not wait for GPU work that only declared the whole heap around it |
+| `VICTORY_WRITE_BESIDE=1` | Shader results go into the title's memory through a second mapping, so the page stays guarded and the copy that made them is not copied, uploaded and hashed again (about 60 MB of 150 MB copied a frame was this echo) |
+| `VICTORY_SKIP_SAME=1` | Of a page found written, only the 4 KiB pieces that differ are taken and sent up (101 to 24 MB sent up a frame) |
+
+Always on: a bitmap for the guards' clean blocks, and one protection call for
+consecutive blocks. With 16 GB of card memory or more,
+`VICTORY_CARD_WINDOWS_MB=6144` and `VICTORY_CARD_BUFFERS_MB=4096` (victory-fork's
+own switches) keep more of the title's memory on the card.
+
+### Measured
+
+One machine (RTX 4090 24 GB, Ryzen 7 7800X3D, 32 GB RAM, Windows 11), one fixed
+view in the first gameplay room, about 4,900 draws, Series X profile. Single
+launches: a few milliseconds either way are noise.
+
+| | ms a frame | frames a second |
+|---|---|---|
+| victory-fork `9376fd6`, defaults (1 launch) | 207-228 | 4.4-4.8 |
+| this fork, all switches above (4 launches) | 105-125 | 8.0-9.6 |
+
+### Use
+
+```powershell
+cargo build --release -p victory
+powershell -ExecutionPolicy Bypass -File scripts\play-fast.ps1 -Exe "<game dir>\<the title's exe>"
+```
+
+`-Safe` starts it with none of the switches; `-SmallCard` leaves out the two
+card-memory ones.
+
+### Known risks and problems
+
+- **A GPU hang is possible** with `VICTORY_INDIRECT_DIRECT=1`: mesh draws are no
+  longer bounded. An earlier form that also covered vertex draws hung the card
+  at world load in 3 launches of 8; those draws take their counts from compute
+  programs that a card of 32-lane waves refuses. With the mesh-only form: no
+  hang in 17 world loads (one to three minutes in the first room each, not all
+  of them with every switch on). Save your work before playing.
+- `VICTORY_FILL_FREE=1` lets a constant buffer be read before the GPU work that
+  might write it; none of some 1,800 reads looked at afterwards had changed,
+  which is evidence and not proof.
+- Tested at one spot in the game and on one NVIDIA card. Other places and AMD
+  cards are untested.
+- The picture is victory-fork's: shadows are black (no ray tracing), and blocky
+  patches remain at some edges.
+
+These changes were developed with [Claude Code](https://claude.com/claude-code).
+Everything below is victory-fork's own README, unchanged.
+
+---
+
 # VIctory fork (work in progress)
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
