@@ -1,4 +1,4 @@
-# xbx2c: a faster fork of victory-fork (work in progress)
+# xbx2c (Xbox SeriesX to CoreWin): a faster fork of victory-fork (work in progress)
 
 A fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork),
 which is itself a fork of [VIctory](https://github.com/Marvisak/VIctory). It
