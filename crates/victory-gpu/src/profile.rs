@@ -258,7 +258,7 @@ impl Role {
         match self {
             Role::Submit => "SUBMITTING (threads that send lists to the card: Host::submit)",
             Role::Record => "RECORDING (threads that make list calls and do not submit)",
-            Role::Late => "LATE WAIT (victory-late-wait: settles submissions sent ahead)",
+            Role::Late => "LATE WAIT (victory-late-wait, victory-relay, victory-sync, victory-bury)",
             Role::Wide => "WIDE WORKERS (victory-wide-N: copies and compares of title memory)",
             Role::Pipelines => "PIPELINE WORKERS (victory-pipelines-N)",
             Role::TitleMain => "TITLE MAIN (title-main)",
@@ -272,7 +272,7 @@ impl Role {
             Some(Role::Pipelines)
         } else if name.starts_with("victory-wide-") {
             Some(Role::Wide)
-        } else if name == "victory-late-wait" {
+        } else if matches!(name, "victory-late-wait" | "victory-relay" | "victory-sync" | "victory-bury") {
             Some(Role::Late)
         } else if name == "title-main" {
             Some(Role::TitleMain)

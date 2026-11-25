@@ -202,10 +202,25 @@ impl Fine {
     /// The bytes of `[from, to)` the card had not received when a fetch sent
     /// after send `fetched_after` ran: see `Shadow::card_merge_relay`.
     pub(crate) fn newer(&self, from: usize, to: usize, fetched_after: u64, out: &mut Vec<(usize, usize)>) {
+        if from >= to {
+            return;
+        }
         let f = self.lock();
-        f.0.runs_in(from, to, out);
-        for (_, bytes) in f.1.iter().filter(|s| s.0 > fetched_after) {
-            bytes.runs_in(from, to, out);
+        for page in from / PAGE..=(to - 1) / PAGE {
+            // The sends' sets as one, then its runs: the same pages are in
+            // most of some thirty sends, and each set's runs, put out one
+            // after the other, were sorted and joined by the caller.
+            let mut all: Option<Box<[u64; PAGE / 64]>> = None;
+            let newer = f.1.iter().filter(|s| s.0 > fetched_after).map(|s| &s.1);
+            for bits in std::iter::once(&f.0).chain(newer).filter_map(|b| b.0.get(&page)) {
+                match &mut all {
+                    None => all = Some(bits.clone()),
+                    Some(all) => all.iter_mut().zip(bits.iter()).for_each(|(a, b)| *a |= b),
+                }
+            }
+            if let Some(all) = all {
+                Bytes(BTreeMap::from([(page, all)])).runs_in(from, to, out);
+            }
         }
     }
 }
@@ -327,6 +342,19 @@ mod tests {
         assert!(!fine.take(5, 0, true).is_empty());
         assert_eq!(newer(4), [(10, 12)]);
         assert!(newer(5).is_empty());
+        // Several sends' bytes as one set, in order, each run once.
+        let several = Fine::default();
+        several.merge(0, &[1; 20], &mut [0; 20]);
+        several.take(1, 0, true);
+        several.merge(PAGE - 4, &[1; 8], &mut [0; 8]);
+        several.take(2, 0, true);
+        several.merge(10, &[1; 20], &mut [0; 20]);
+        let mut out = Vec::new();
+        several.newer(5, 2 * PAGE, 0, &mut out);
+        assert_eq!(out, [(5, 30), (PAGE - 4, PAGE), (PAGE, PAGE + 4)]);
+        out.clear();
+        several.newer(5, 2 * PAGE, 1, &mut out);
+        assert_eq!(out, [(10, 30), (PAGE - 4, PAGE), (PAGE, PAGE + 4)]);
         assert!(fine.take(6, 5, true).is_empty());
         assert!(newer(4).is_empty(), "let go");
     }

@@ -375,34 +375,54 @@ pub fn title_memory_section_gone(section: usize) {
     }
 }
 
-/// Writes `len` bytes into the physical pages that the title's view shows at
-/// `at`, through a mapping of ours: the guards of the title's views stay as
-/// they are. `false`: nothing written (not one view's, no live section, no
-/// mapping, pages not there).
-pub(crate) fn write_beside(at: usize, from: *const u8, len: usize) -> bool {
+/// Calls `with` with the address, in a mapping of ours, of the physical bytes
+/// that one view of the title's shows at `[at, at + len)`; `None` if they are
+/// not one view's, or of no live section, or it cannot be mapped. The
+/// mapping stays while `with` runs. Nothing is ever guarded there: a write
+/// through it leaves the guards of the title's views as they are.
+fn beside<R>(at: usize, len: usize, with: impl FnOnce(usize) -> R) -> Option<R> {
     let (section, offset) = {
         let v = views();
-        let Some((&base, &(bytes, section, offset))) = v.views.range(..=at).next_back() else {
-            return false;
-        };
+        let (&base, &(bytes, section, offset)) = v.views.range(..=at).next_back()?;
         let within = at - base;
-        if within.checked_add(len).is_none_or(|end| end > bytes) {
-            return false;
+        if within.checked_add(len)? > bytes {
+            return None;
         }
         (section, offset + within as u64)
     };
     let mut maps = besides();
-    let Some(map) = maps.get_mut(&section) else {
-        return false;
-    };
-    let map = *map.get_or_insert_with(|| {
+    let map = *maps.get_mut(&section)?.get_or_insert_with(|| {
         // SAFETY: a section the runtime has not closed (it says so first);
         // the whole of it, mapped anew.
         let view = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_READ | mem::FILE_MAP_WRITE, 0, 0, 0) };
         tracing::info!(section, mapped = !view.Value.is_null(), "a section of the title's pages, mapped beside its views");
         view.Value as usize
     });
-    map != 0 && crate::host::write_kernel((map + offset as usize) as *mut u8, from, len)
+    (map != 0).then(|| with(map + offset as usize))
+}
+
+/// Writes `len` bytes into the physical pages that the title's view shows at
+/// `at`, beside the guards. `false`: nothing written.
+pub(crate) fn write_beside(at: usize, from: *const u8, len: usize) -> bool {
+    beside(at, len, |to| crate::host::write_kernel(to as *mut u8, from, len)).unwrap_or(false)
+}
+
+/// Puts the `runs` (offset, bytes) of `bytes` into title view memory at `at`,
+/// through our mapping and with no call to the kernel for each. `false`:
+/// nothing written.
+///
+/// # Safety
+/// The caller has just read all of `[at, at + bytes.len())`: its pages are
+/// there (a section's page, once committed, is for as long as it lives), and
+/// the runs lie in `bytes`.
+pub(crate) unsafe fn write_runs(at: usize, bytes: &[u8], runs: &[(usize, usize)]) -> bool {
+    beside(at, bytes.len(), |to| {
+        for &(off, len) in runs {
+            // SAFETY: the caller's; the mapping is ours and stays meanwhile.
+            unsafe { std::ptr::copy_nonoverlapping(bytes[off..off + len].as_ptr(), (to + off) as *mut u8, len) };
+        }
+    })
+    .is_some()
 }
 
 /// The address of the 64 KiB page shown at `page` in every title view that
@@ -1291,6 +1311,48 @@ mod tests {
             assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// Runs land in a section's pages at their view's address, with the view
+    /// read-only, and no other byte changes; not outside one view, and not
+    /// once the section is gone.
+    #[test]
+    fn runs_are_written_beside_a_guarded_view() {
+        // SAFETY: a pagefile section of four pages, two of them mapped
+        // read-write from the second on.
+        let (section, view) = unsafe {
+            let section = mem::CreateFileMappingW(-1isize as _, std::ptr::null(), mem::PAGE_READWRITE, 0, (4 * K64) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let view = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, K64 as u32, 2 * K64).Value as usize;
+            assert_ne!(view, 0);
+            std::ptr::write_bytes(view as *mut u8, 7, 2 * K64);
+            let mut old = 0;
+            assert_ne!(mem::VirtualProtect(view as *const _, 2 * K64, mem::PAGE_READONLY, &mut old), 0);
+            (section, view)
+        };
+        super::title_memory_section(section as usize, 4 * K64 as u64, true);
+        super::title_memory_view(view, 2 * K64, section as usize, K64 as u64);
+        let bytes: Vec<u8> = (0..300).map(|i| i as u8).collect();
+        let at = view + K64 - 100;
+        // SAFETY: committed pages of the section.
+        assert!(unsafe { super::write_runs(at, &bytes, &[(0, 4), (96, 12), (299, 1)]) });
+        // SAFETY: the view.
+        let got = unsafe { std::slice::from_raw_parts(view as *const u8, 2 * K64) };
+        for (i, &b) in got.iter().enumerate() {
+            let k = (view + i).wrapping_sub(at);
+            let want = if k < 4 || (96..108).contains(&k) || k == 299 { bytes[k] } else { 7 };
+            assert_eq!(b, want, "{i}");
+        }
+        // SAFETY (each): nothing is written.
+        assert!(!unsafe { super::write_runs(view + 2 * K64 - 10, &bytes, &[(0, 1)]) }, "past the view");
+        super::title_memory_section_gone(section as usize);
+        assert!(!unsafe { super::write_runs(at, &bytes, &[(0, 1)]) }, "gone");
+        super::views_gone(view, 2 * K64);
+        // SAFETY: our view and section.
+        unsafe {
+            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ });
+            windows_sys::Win32::Foundation::CloseHandle(section);
         }
     }
 

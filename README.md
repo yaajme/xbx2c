@@ -10,9 +10,11 @@ yet**.
 copy of the game. Not affiliated with or endorsed by its developer or
 publisher.
 
-> **The newest commit has not been run in the game.** It builds, and its tests
-> pass but for what is named below. If it misbehaves, try `-Safe`, or go back to
-> `b79832e` (which has the two faults named under "Fixed since `b79832e`").
+> **The newest commit itself has not reached the world.** Two launches of builds
+> that differ from it in two small ways did (one switch more, since removed;
+> descriptor passes did not yet keep what an earlier pass had not taken). The run
+> of the commit was stopped while loading, when the machine ran low on memory. If it misbehaves, try `-Safe`, or
+> go back to `b79832e` (which has the faults named under "Fixed since `b79832e`").
 
 ## Use
 
@@ -52,7 +54,7 @@ earlier `VICTORY_COPY_FETCH`, which now selects it):
 With 16 GB of card memory or more, `VICTORY_CARD_WINDOWS_MB=6144` and
 `VICTORY_CARD_BUFFERS_MB=4096` (victory-fork's own) keep more on the card.
 
-Not tried in the game yet, or only in part (`-Experimental`):
+Newer, tried in a few launches at the one spot below (`-Experimental`):
 
 | Switch | What it does |
 |--------|--------------|
@@ -81,6 +83,12 @@ Not tried in the game yet, or only in part (`-Experimental`):
   blocks, readers of the heap table beside each other, one barrier for a
   submission's uploads.
 
+- Shadows of hair and see-through things: the program that draws them
+  (`CS_ShadowRenderTiledCascadesAlpha`) is translated, per host wave of 32 (an
+  approximation). The stepped edges at a shoulder in the sun were gone in the
+  one launch with it.
+- `VICTORY_WAVE_WIDE` takes a comma-separated list of container digests.
+
 ## Fixed since `b79832e`
 
 - `VICTORY_WRITE_BESIDE=1` kept its mapping of a section after the title freed
@@ -95,15 +103,17 @@ Both were off by default, and on with `play-fast.ps1`.
 
 One machine (RTX 4090 24 GB, Ryzen 7 7800X3D, 32 GB RAM, Windows 11), one fixed
 view in the first gameplay room, about 4,900 draws, Series X profile. A few
-milliseconds either way are noise. **Not of the newest commit.**
+milliseconds either way are noise.
 
 | | ms a frame | frames a second |
 |---|---|---|
 | victory-fork `9376fd6`, defaults (1 launch) | 207-228 | 4.4-4.8 |
 | this fork `b79832e`, its switches (4 launches) | 105-125 | 8.0-9.6 |
 
-A later build with most of the experimental switches ran at 100-107 ms with a
-profiler on (1 launch). About 15 GB of card memory and 16 GB of RAM were in use.
+Builds close to the newest, with every experimental switch, `VICTORY_AMBIENT=0.6`
+and five digests in `VICTORY_WAVE_WIDE`: 103-110 ms (1 launch; standing still, after one to two minutes of 150-1,300 ms frames as the world loads),
+102-117 with a profiler on and the hair shadows (1 launch). No faster than `b79832e` by more than the noise; what it buys is a
+shorter copy-back and the fixes above. About 15 GB of card memory and 16 GB of RAM were in use.
 
 ## Known risks and problems
 
@@ -114,9 +124,14 @@ profiler on (1 launch). About 15 GB of card memory and 16 GB of RAM were in use.
   Save your work before playing.
 - The sky showed colour banding in one run, with another game starting beside
   it; the cause is not known.
+- **Do not turn on `VICTORY_BVH_BUILDER=1` with `VICTORY_FIRSTLANE_OWN=1`.** Every
+  program of the structure builder compiles that way, but a run of it wrote over
+  the title's memory and crashed it, with `VICTORY_BVH_QUARANTINE=1` too.
+- It takes some 16 GB of RAM and a commit of 30 GB.
 - Tested at one spot, on one NVIDIA card. AMD cards are untested.
-- Shadows are black without `-Ambient` (no ray tracing); blocky patches remain
-  at some edges.
+- Shadows are black without `-Ambient` (no ray tracing); a green patch
+  and a black shape remain at the lower right of the first room, and its window
+  lacks the wet glass.
 - Tests: two of `victory-shader`'s rectangle tests fail, as in victory-fork; in
   `victory-gpu` one test of the in-place path fails now and then, and a run
   crashes now and then (seen in victory-fork too; cause not known).

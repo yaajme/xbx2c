@@ -785,6 +785,24 @@ pub(crate) fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> 
     out
 }
 
+/// Puts the `runs` (offset, bytes) of `title` into title memory at `address`,
+/// all of which was just read: beside the views if it is view memory, else a
+/// kernel call for each (2,000 and more of those a frame were 35 ms of the
+/// thread that lands flights).
+fn put_runs(address: usize, title: &[u8], runs: &[(usize, usize)]) {
+    // SAFETY: the caller has read it all.
+    if unsafe { crate::inplace::write_runs(address, title, runs) } {
+        return;
+    }
+    for &(off, len) in runs {
+        let (to, from) = ((address + off) as *mut u8, title[off..].as_ptr());
+        // SAFETY: our bytes; the title's side may be gone or guarded again.
+        if !crate::safe_copy::on() || !unsafe { crate::safe_copy::write(to, from, len) } {
+            crate::host::write_mapped(to, from, len);
+        }
+    }
+}
+
 /// The runs of 4-byte words of title memory (cut on its addresses;
 /// `read` and `merged` are of the memory at `address`) that hold a byte in
 /// which `merged` differs from `read`, as (offset, bytes) in order to
@@ -792,26 +810,44 @@ pub(crate) fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> 
 /// other byte of `merged` is the title's as it was read.
 fn word_runs(address: usize, read: &[u8], merged: &[u8], mut put: impl FnMut(usize, usize)) {
     let n = read.len().min(merged.len());
-    let mut i = 0;
-    while i < n {
-        // Equal bytes are passed over, 32 at a time while they last.
-        match first_difference(&read[i..n], &merged[i..n]) {
-            Some(d) => i += d,
-            None => break,
-        }
-        // From the word that holds this byte (or the stretch's first
-        // byte) to the end of the last word in a row that holds one.
-        let first = i - ((address + i) & 3).min(i);
-        let mut end = first;
-        while end < n {
-            let word = (((address + end) | 3) + 1 - address).min(n);
-            if read[end..word] == merged[end..word] {
-                break;
+    let (read, merged) = (&read[..n], &merged[..n]);
+    // The run being made: from, to.
+    let mut run: Option<(usize, usize)> = None;
+    let mut word = |from: usize, to: usize| match &mut run {
+        Some(r) if r.1 == from => r.1 = to,
+        _ => {
+            if let Some((a, b)) = run.replace((from, to)) {
+                put(a, b - a);
             }
-            end = word;
         }
-        put(first, end - first);
-        i = end;
+    };
+    // To the first whole word of title memory, then words, then what is left.
+    let head = ((4 - (address & 3)) & 3).min(n);
+    if read[..head] != merged[..head] {
+        word(0, head);
+    }
+    let tail = head + (n - head) / 4 * 4;
+    let mut i = head;
+    while i < tail {
+        // Equal stretches a step at a time.
+        let step = (tail - i).min(256);
+        if read[i..i + step] == merged[i..i + step] {
+            i += step;
+            continue;
+        }
+        let words = read[i..i + step].chunks_exact(4).zip(merged[i..i + step].chunks_exact(4));
+        for (k, (a, b)) in words.enumerate() {
+            if a != b {
+                word(i + 4 * k, i + 4 * k + 4);
+            }
+        }
+        i += step;
+    }
+    if read[tail..] != merged[tail..] {
+        word(tail, n);
+    }
+    if let Some((a, b)) = run {
+        put(a, b - a);
     }
 }
 
@@ -1975,6 +2011,37 @@ mod merge_tests {
         assert_eq!(runs, [(0, 1), (3, 1)], "the GPU's bytes only");
     }
 
+    /// The words that hold a differing byte, cut on title addresses, against
+    /// looking at each.
+    #[test]
+    fn word_runs_are_the_words_that_differ() {
+        let mut x = 9usize;
+        let mut next = || {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x >> 33
+        };
+        for address in [0x1000usize, 0x1001, 0x1002, 0x1003] {
+            for n in [0usize, 1, 2, 3, 4, 5, 7, 64, 255, 256, 257, 1000, 4099] {
+                for every in [1usize, 3, 40, 500, usize::MAX] {
+                    let read: Vec<u8> = (0..n).map(|_| next() as u8).collect();
+                    let merged: Vec<u8> = read.iter().map(|b| if next() % every == 0 { b ^ 0x21 } else { *b }).collect();
+                    let mut got = Vec::new();
+                    super::word_runs(address, &read, &merged, |off, len| got.push((off, len)));
+                    let word = |i: usize| (address + i) >> 2;
+                    let hit: std::collections::HashSet<usize> = (0..n).filter(|&i| read[i] != merged[i]).map(word).collect();
+                    let mut want: Vec<(usize, usize)> = Vec::new();
+                    for i in (0..n).filter(|&i| hit.contains(&word(i))) {
+                        match want.last_mut() {
+                            Some(w) if w.0 + w.1 == i => w.1 += 1,
+                            _ => want.push((i, 1)),
+                        }
+                    }
+                    assert_eq!(got, want, "{address:#x} {n} {every}");
+                }
+            }
+        }
+    }
+
     /// The runs hold exactly the bytes that differ: putting them into the
     /// old bytes gives the new ones, and no run holds an equal byte.
     #[test]
@@ -2695,13 +2762,15 @@ impl Shadow {
         if !merge_piece(now, held, title) {
             return 0;
         }
-        crate::host::shaders_write(start + at, &title[..]);
+        // (The words of the card's alone: the rest may be older than the
+        // title's bytes there by now.)
+        for &(off, len) in &runs {
+            crate::host::shaders_write(start + at + off, &title[off..off + len]);
+        }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
         // Only the card's words, as in `card_merge_relay`.
-        for &(off, len) in &runs {
-            crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
-        }
+        put_runs(start + at, title, &runs);
         n
     }
 
@@ -3502,7 +3571,9 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
-        crate::host::shaders_write(start + at, &title[..]);
+        for &(off, len) in &runs {
+            crate::host::shaders_write(start + at + off, &title[off..off + len]);
+        }
         if crate::watch::beside_on()
             && let Some((before, now)) = crate::watch::write_beside(start + at, title.as_ptr(), n)
         {
@@ -3527,9 +3598,7 @@ impl Shadow {
         // and a write of the title's landing there since stays (written back
         // whole, it was undone: a shader then read the value before it).
         // (Beside the guards, above, the page is known not written since.)
-        for &(off, len) in &runs {
-            crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
-        }
+        put_runs(start + at, title, &runs);
         #[cfg(feature = "diagnostics")]
         echo_ours(self.id, start + at, n);
         n

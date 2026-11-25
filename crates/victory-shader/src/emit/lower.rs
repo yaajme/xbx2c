@@ -7495,8 +7495,10 @@ impl<'a> Lower<'a> {
                     // the console's.
                     None if self.mask_data == MaskData::Console => {
                         // Each host wave taken as a wave of its own has no
-                        // console lane numbers to pick the bits by.
-                        if self.local {
+                        // console lane numbers to pick the bits by, but in
+                        // the last resort, where lanes are numbered by half
+                        // ([`with_local_waves_any`]).
+                        if self.local && !self.local_any {
                             return Err("a constant lane mask in a half-wave");
                         }
                         let m = mask.ok_or(UNTRACKED)?;

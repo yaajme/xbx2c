@@ -173,28 +173,63 @@ fn mirror(handle: u64) {
 /// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
-    use std::sync::atomic::Ordering::Relaxed;
+    sync_written(heaps_written());
+}
+
+/// A registered heap (its start, its address) and the ranges of it written
+/// since they were last taken.
+#[cfg(windows)]
+type HeapWritten = (u64, usize, Vec<(usize, usize)>);
+
+/// The first half of [`sync_heaps`]: what was written. (It asks the write
+/// watch, behind the lock a submission's preparing holds for most of its
+/// time: done beside that it stood for it.)
+#[cfg(windows)]
+fn heaps_written() -> Vec<HeapWritten> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0")) {
+        return Vec::new();
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    heaps
+        .iter()
+        .filter_map(|&(start, end, at)| {
+            // SAFETY: registered heaps are live (removed when dropped).
+            let heap = unsafe { &*(at as *const Heap) };
+            let (Some(Some(_)), Some(written)) = (heap.host.get(), &heap.written) else {
+                return None;
+            };
+            let ranges = written.take(start as usize, end as usize);
+            (!ranges.is_empty()).then_some((start, at, ranges))
+        })
+        .collect()
+}
+
+/// The second: the records in those ranges that are new are mirrored.
+#[cfg(windows)]
+fn sync_written(taken: Vec<HeapWritten>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if taken.is_empty() {
         return;
     }
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    for &(start, end, at) in heaps.iter() {
+    for (start, at, ranges) in taken {
+        if !heaps.iter().any(|&(s, _, h)| (s, h) == (start, at)) {
+            continue;
+        }
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
-        let (Some(Some(host)), Some(written), Some(step)) =
-            (heap.host.get(), &heap.written, increment(heap.desc.kind))
-        else {
+        let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
             continue;
         };
         let step = u64::from(step);
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
-        for (range_from, range_end) in written.take(start as usize, end as usize) {
+        for (range_from, range_end) in ranges {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 let from = page.max(range_from);
@@ -245,10 +280,12 @@ pub(crate) fn sync_heaps() {
 #[cfg(windows)]
 pub(crate) struct Syncing(());
 
-/// Passes asked for, and done.
+/// Passes asked for, and done; what those not done yet are of.
 #[cfg(windows)]
 static ASIDE: (std::sync::Mutex<(u64, u64)>, std::sync::Condvar) =
     (std::sync::Mutex::new((0, 0)), std::sync::Condvar::new());
+#[cfg(windows)]
+static ASIDE_OF: std::sync::Mutex<Vec<HeapWritten>> = std::sync::Mutex::new(Vec::new());
 
 /// Whether [`sync_heaps_aside`] is on (and its thread there).
 #[cfg(windows)]
@@ -267,6 +304,10 @@ pub(crate) fn syncs_aside() -> bool {
 #[cfg(windows)]
 pub(crate) fn sync_heaps_aside() -> Option<Syncing> {
     syncs_aside().then(|| {
+        // (After what an earlier pass has not taken yet: the watch tells of a
+        // range once.)
+        let taken = heaps_written();
+        ASIDE_OF.lock().unwrap_or_else(|e| e.into_inner()).extend(taken);
         ASIDE.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
         ASIDE.1.notify_all();
         Syncing(())
@@ -304,7 +345,8 @@ fn syncs() {
             }
         }
         let done = Done;
-        if std::panic::catch_unwind(sync_heaps).is_err() {
+        let of = std::mem::take(&mut *ASIDE_OF.lock().unwrap_or_else(|e| e.into_inner()));
+        if std::panic::catch_unwind(|| sync_written(of)).is_err() {
             tracing::error!("the pass over descriptors copied as bytes panicked");
         }
         drop(done);

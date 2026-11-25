@@ -2590,7 +2590,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on() {
+                        if !touches(written, dst, dst + len) && fill_ahead::may(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -2614,7 +2614,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         // Not waited for, and checked when the flights land
                         // (`fill_ahead`).
-                        if fill_ahead::on() {
+                        if fill_ahead::may(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -2661,6 +2661,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 /// looked at every one of them: 44 fills of 480 bytes, and after the wait
 /// the bytes were the same 44 times.
 ///
+/// (Since then not all fills wait, but those that read where it happened.)
+///
 /// What it risks, and how it is bounded: a fill that reads bytes a flight
 /// in the air is about to change takes the old bytes, and the lists of
 /// that one submission draw with them. `wrote` sees it when the flight
@@ -2679,8 +2681,14 @@ mod fill_ahead {
     /// every present that waits).
     const KEEP: u64 = 16;
 
-    /// A flight changed bytes a fill had read ahead of it: fills wait.
+    /// Flights changed bytes fills had read ahead of them in more places than
+    /// [`PLACES`]: fills wait.
     static WAIT: AtomicBool = AtomicBool::new(false);
+    /// The 64 KiB pieces where that happened: what reads there waits from then
+    /// on, and nothing else does. (One such read while the world loaded, of a
+    /// buffer shaders do write, had every fill of the run wait: 43 ms a frame.)
+    static WAITS: std::sync::RwLock<std::collections::BTreeSet<usize>> = std::sync::RwLock::new(std::collections::BTreeSet::new());
+    const PLACES: usize = 256;
     /// Since the last frame line: fills that read ahead; landings' writes
     /// that touched one's piece. Since the start: fills that read bytes a
     /// flight then changed.
@@ -2712,6 +2720,29 @@ mod fill_ahead {
     pub(super) fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) && !WAIT.load(Relaxed)
+    }
+
+    /// Whether a read of `len` bytes at `src` goes ahead of flights that may
+    /// write them.
+    pub(super) fn may(src: usize, len: usize) -> bool {
+        on() && (len == 0 || {
+            let waits = WAITS.read().unwrap_or_else(|e| e.into_inner());
+            waits.range(src / PIECE..=(src + len - 1) / PIECE).next().is_none()
+        })
+    }
+
+    /// The pieces of `[from, to)` are waited for from here on; whether one of
+    /// them was not yet.
+    fn wait_there(from: usize, to: usize) -> bool {
+        let mut waits = WAITS.write().unwrap_or_else(|e| e.into_inner());
+        let mut new = false;
+        for piece in from / PIECE..=(to - 1) / PIECE {
+            new |= waits.insert(piece);
+        }
+        if waits.len() > PLACES {
+            WAIT.store(true, Relaxed);
+        }
+        new
     }
 
     /// A fill reads `len` bytes at `src` ahead of flights that may write
@@ -2769,11 +2800,11 @@ mod fill_ahead {
             }
             let n = COUNT[2].fetch_add(1, Relaxed) + 1;
             let first = now.iter().zip(&new[a - at..b - at]).position(|(x, y)| x != y).unwrap_or(0);
-            if !WAIT.swap(true, Relaxed) {
+            if wait_there(from, to) && (n <= 16 || n.is_power_of_two()) {
                 tracing::warn!(
                     "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
                      them (first at {:#x}, landed in frame {frame}): the lists of that submission drew with the bytes from before. \
-                     Fills wait for flights again from here on, as with VICTORY_FILL_WAIT=1 ({n} such fills)",
+                     What reads there waits for flights from here on ({n} such fills)",
                     to - from,
                     a + first
                 );

@@ -215,6 +215,13 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out
 }
 
+/// Whether `VICTORY_WAVE_WIDE`'s value is for the container with `digest`: `1` is for every
+/// one, else those whose digests it lists. Pure, for testing.
+fn named(value: &str, digest: &[u8; 16]) -> bool {
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    value.trim() == "1" || value.split(',').any(|v| v.trim().eq_ignore_ascii_case(&hex))
+}
+
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
 /// unreadable. Pure, for testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {
@@ -422,7 +429,9 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // Or for the programs it names alone, by their containers' digests (32 hex digits
+        // each, a comma between).
+        let wide_on = std::env::var("VICTORY_WAVE_WIDE").is_ok_and(|v| named(&v, &c.digest));
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -827,6 +836,15 @@ mod tests {
     use super::container::SigElement;
     use super::shader::Shader;
     use super::*;
+
+    #[test]
+    fn wave_wide_names_every_program_or_the_listed() {
+        let digest = [0xabu8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let hex = "ab0102030405060708090a0b0c0d0e0f";
+        assert!(named("1", &digest) && named(" 1", &digest));
+        assert!(named(hex, &digest) && named(&format!("00, {} ,", hex.to_uppercase()), &digest));
+        assert!(!named("0", &digest) && !named("", &digest) && !named("ab01", &digest));
+    }
     use crate::native::{ComputeIo, StageIo};
 
     /// A pixel shader writing SV_StencilRef (channel y of `exp mrtz`).

@@ -29,6 +29,21 @@ core::arch::global_asm!(
     "mov rsi, r10",
     "mov eax, 1",
     "ret",
+    // The same; a fault of the destination ends it too.
+    ".globl victory_safe_write",
+    ".globl victory_safe_write_at",
+    "victory_safe_write:",
+    "mov r9, rdi",
+    "mov r10, rsi",
+    "mov rdi, rcx",
+    "mov rsi, rdx",
+    "mov rcx, r8",
+    "victory_safe_write_at:",
+    "rep movsb",
+    "mov rdi, r9",
+    "mov rsi, r10",
+    "mov eax, 1",
+    "ret",
     "victory_safe_copy_failed:",
     "mov rdi, r9",
     "mov rsi, r10",
@@ -39,6 +54,8 @@ core::arch::global_asm!(
 unsafe extern "system" {
     fn victory_safe_copy(dst: *mut u8, src: *const u8, len: usize) -> u64;
     fn victory_safe_copy_at();
+    fn victory_safe_write(dst: *mut u8, src: *const u8, len: usize) -> u64;
+    fn victory_safe_write_at();
     fn victory_safe_copy_failed();
 }
 
@@ -59,15 +76,16 @@ fn install() -> bool {
     unsafe extern "system" fn on_read(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         let (record, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
-        if context.Rip != victory_safe_copy_at as *const () as u64 {
+        let writes = context.Rip == victory_safe_write_at as *const () as u64;
+        if !writes && context.Rip != victory_safe_copy_at as *const () as u64 {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let code = record.ExceptionCode;
         let fault = code == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || code == EXCEPTION_IN_PAGE_ERROR as NTSTATUS
             || code == EXCEPTION_GUARD_PAGE as NTSTATUS;
-        // A write fault (1) is another handler's.
-        if !fault || record.NumberParameters < 1 || record.ExceptionInformation[0] == 1 {
+        // A write fault (1) is another handler's, but for a write.
+        if !fault || record.NumberParameters < 1 || (!writes && record.ExceptionInformation[0] == 1) {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         context.Rip = victory_safe_copy_failed as *const () as u64;
@@ -89,8 +107,44 @@ pub(crate) unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
     unsafe { victory_safe_copy(dst, src, len) != 0 }
 }
 
+/// Writes `len` bytes of ours at `src` to `dst`, which may not be there or not
+/// be writable: `false` then (some bytes may have been written).
+///
+/// # Safety
+/// `src` is readable for `len` bytes; the two do not overlap; `on` is true.
+pub(crate) unsafe fn write(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    // SAFETY: the caller's, and the handler takes the faults.
+    unsafe { victory_safe_write(dst, src, len) != 0 }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Bytes land, and a destination that is missing or read-only is `false`
+    /// and not a crash.
+    #[test]
+    fn a_missing_or_read_only_destination_ends_the_write() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            VirtualProtect,
+        };
+        assert!(super::install());
+        let from = [9u8; 0x1000];
+        // SAFETY: three pages reserved, the first two committed.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 0x3000, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!VirtualAlloc(base.cast(), 0x2000, MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert!(super::write(base.add(0x10), from.as_ptr(), 0x1000));
+            assert!((0..0x1000).all(|i| *base.add(0x10 + i) == 9) && *base == 0);
+            assert!(!super::write(base.add(0x2000), from.as_ptr(), 8));
+            assert!(!super::write(base.add(0x1ff8), from.as_ptr(), 16));
+            let mut old = 0;
+            VirtualProtect(base.cast(), 0x1000, PAGE_READONLY, &mut old);
+            assert!(!super::write(base, from.as_ptr(), 8));
+            assert_eq!(*base, 0);
+            VirtualFree(base.cast(), 0, MEM_RELEASE);
+        }
+    }
+
     /// Bytes arrive, a missing page is `false` and not a crash, and so is a
     /// copy that starts in a page that is there and runs into one that is not.
     #[test]
