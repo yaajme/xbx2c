@@ -49,6 +49,8 @@ every switch has a comment where its read in the code. thats the docs, sorry. th
 
 ## broken / known bad
 
+- the "oil spill" look (blotchy painted walls/skin/clothes + brown haze) was the fake indirect light, `VICTORY_AMBIENT=0.8` + `VICTORY_AMBIENT_AIR=1.5`, that cool_fox's launcher turned on. its averaged on a 64x36 grid and smeared over the screen by depth so you get flat patches w/ hard edges. launcher doesnt set it anymore -> clean image but rooms are darker (real GI needs RT which we dont run). set them yourself if you want it back. working on a smoother version
+- the frosted/melty window in the prison cell is CORRECT, thats the games glass. old xbx2c drew it clear which was wrong
 - 3 compute shaders dont translate (`no wave32 lowering for this wave64 program`) -> their draws get dropped. no idea yet whats missing on screen bc of it
 - textures picked by index keep getting re-uploaded ("changed after its upload with nothing to tell of it"), spams the log, probably costs frames
 - trees/plants/far buildings flicker outdoors in places (upstream says, havent checked myself)

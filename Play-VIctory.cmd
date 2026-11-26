@@ -15,7 +15,6 @@ if not exist "%runner%" (
   echo Extract the Windows release or run cargo build --release --locked -p victory. 1>&2
   exit /b 2
 )
-if not defined VICTORY_AMBIENT_AIR set "VICTORY_AMBIENT_AIR=1.5"
 if not defined VICTORY_CACHE_DIR set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\VIctory\cache-pareto"
 if not defined VICTORY_TEXTURE_NO_WAIT set "VICTORY_TEXTURE_NO_WAIT=1"
 if not defined VICTORY_RELAY set "VICTORY_RELAY=2"
@@ -29,7 +28,6 @@ if not defined VICTORY_INDIRECT_BATCH set "VICTORY_INDIRECT_BATCH=2"
 if not defined VICTORY_MAP_THREADS set "VICTORY_MAP_THREADS=1"
 if not defined VICTORY_CARD_AWAKE set "VICTORY_CARD_AWAKE=1"
 if not defined VICTORY_SHOW_AFTER set "VICTORY_SHOW_AFTER=1"
-if not defined VICTORY_AMBIENT set "VICTORY_AMBIENT=0.8"
 if not defined VICTORY_THIN set "VICTORY_THIN=1"
 if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=8"
 if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"
