@@ -118,9 +118,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         }
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+        uint3 g = src_args.Load3(src_at);
+        // Up to WIDEST groups in x run as asked (`widest`).
+        g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+        // x * y fits 32 bits where it is looked at; the whole count may not.
+        if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64u;
@@ -248,9 +250,51 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
     make_from(device, SOURCE)
 }
 
+/// The most groups in x that an indirect dispatch runs as the title asks:
+/// 65,535 is the most D3D12 names for a dispatch, 2^20 ([`SOURCE`]'s GROUPS)
+/// what is bounded here anyway; a record that asks for more still runs
+/// 65,535. After avatarmanz/VIctory-7900XTX `84eae35`.
+///
+/// The title's tile lists are dispatches of one group per tile, 115,200
+/// tiles at 2560x1440: in a captured frame `2dc364df5d3278b8` (a final
+/// gather) asked for 67,440 and `940c2635dc1312f4` for 47,760. Cut to
+/// 65,535 the first lost its last 1,905 tiles, the lowest of the picture:
+/// blocks at the bottom right. The console runs what it is asked (its
+/// counts are 32 bits). D3D12 does not look at indirect counts; AMD cards
+/// run them (that fork's test), and so does an RTX 4090
+/// (`card_runs_wide_indirect_dispatches`: every group once up to 2^20). On
+/// for AMD and NVIDIA cards; `VICTORY_INDIRECT_WIDE=1` for any card, `0` for
+/// none.
+fn widest(amd: bool) -> u32 {
+    let asked = std::env::var("VICTORY_INDIRECT_WIDE").ok();
+    let on = match asked.as_deref().map(str::trim) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => amd,
+    };
+    if on { 1 << 20 } else { 65_535 }
+}
+
+/// Whether `device` is an AMD or NVIDIA card's (both run wide indirect
+/// dispatches).
+fn amd(device: &ID3D12Device) -> bool {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
+    // SAFETY: plain queries.
+    unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
+            .and_then(|a| a.GetDesc1())
+            .is_ok_and(|d| d.VendorId == 0x1002 || d.VendorId == 0x10DE)
+    }
+}
+
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+    let wide = widest(amd(device));
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| tracing::info!(groups = wide, "indirect dispatches run up to this many groups in x"));
+    let source = &format!("#define WIDEST {wide}u\n{source}");
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -756,13 +800,27 @@ void main() {
 
     impl WarpHarness {
         fn new() -> Option<Self> {
+            Self::on(true)
+        }
+
+        /// On the software adapter (`warp`), or on the first hardware one.
+        fn on(warp: bool) -> Option<Self> {
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+                let adapter: IDXGIAdapter = if warp {
+                    factory.EnumWarpAdapter().ok()?
+                } else {
+                    let factory1: IDXGIFactory1 = factory.cast().ok()?;
+                    (0..8).find_map(|i| {
+                        let a = factory1.EnumAdapters1(i).ok()?;
+                        let d = a.GetDesc1().ok()?;
+                        (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0).then(|| a.cast::<IDXGIAdapter>().ok()).flatten()
+                    })?
+                };
                 let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
-                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0) == warp {
                     return None;
                 }
                 let mut device: Option<ID3D12Device> = None;
@@ -951,6 +1009,70 @@ void main() {
             Ok(Clamp { root, pso })
         }
     }
+
+    /// Whether the card runs every group of an indirect dispatch of more than
+    /// 65,535, each once under its own number ([`widest`]): the title's tile
+    /// lists. On the first hardware adapter; with `VICTORY_INDIRECT_WIDE=1`
+    /// on any card, else on AMD cards only. After avatarmanz `84eae35`.
+    #[test]
+    fn card_runs_wide_indirect_dispatches() {
+        const CS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer seen : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
+    uint was;
+    seen.InterlockedAdd(0, 1, was);
+    seen.InterlockedMax(4, group.x, was);
+    seen.InterlockedMax(8, thread.x, was);
+    seen.InterlockedAdd(16 + group.x * 4, 1, was);
+}
+"#;
+        let Some(mut gpu) = WarpHarness::on(false) else {
+            return;
+        };
+        if widest(amd(&gpu.device)) == 65_535 {
+            return;
+        }
+        let worker = compile_cs(&gpu.device, CS).expect("the worker must compile");
+        let sig = gpu.signature(2, 12);
+        for asked in [67_440u32, 115_200, 1 << 20, (1 << 20) + 1] {
+            let runs = if asked > 1 << 20 { 65_535 } else { asked };
+            let (src, src_ptr, _) = gpu.shared_buffer(1024);
+            let (_budget, budget_ptr, budget_gpu) = gpu.shared_buffer(256);
+            let size = 16 + (4 << 20) + 16;
+            let seen = gpu.default_uav(size);
+            let (_back, back_ptr, _) = gpu.shared_buffer(size);
+            let back = _back;
+            let dst = gpu.default_uav(64 << 10);
+            // SAFETY: mapped buffers, which nothing reads yet; an open list
+            // and live buffers.
+            unsafe {
+                std::ptr::write_bytes(budget_ptr, 0, 256);
+                for (w, word) in [asked, 1, 1].into_iter().enumerate() {
+                    src_ptr.cast::<u32>().add(w).write_volatile(word);
+                }
+                let to = (&dst, D3D12_RESOURCE_STATE_COMMON);
+                assert!(record_clamp_as(&gpu.clamp, &gpu.list, to, budget_gpu, (&src, 0), None, (2, 12, 1), false));
+                gpu.list.SetComputeRootSignature(&worker.root);
+                gpu.list.SetPipelineState(&worker.pso);
+                gpu.list.SetComputeRootUnorderedAccessView(0, seen.GetGPUVirtualAddress());
+                gpu.list.ExecuteIndirect(&sig, 1, &dst, 0, None, 0);
+                gpu.list.ResourceBarrier(&[uav_barrier()]);
+                gpu.list.ResourceBarrier(&[transition(&seen, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                gpu.list.CopyBufferRegion(&back, 0, &seen, 0, size);
+            }
+            gpu.submit_and_wait();
+            // SAFETY: the list has run; mapped words.
+            let word = |i: usize| unsafe { back_ptr.cast::<u32>().add(i).read_volatile() };
+            assert_eq!([word(0), word(1), word(2)], [runs, runs - 1, runs - 1], "asked for {asked}");
+            let wrong = (0..runs as usize).find(|&g| word(4 + g) != 1);
+            assert_eq!((wrong, word(4 + runs as usize)), (None, 0), "every group once, asked for {asked}");
+            eprintln!("wide indirect dispatch: asked {asked}, every one of {runs} groups ran once");
+        }
+    }
+
 
     /// The compare of copies in the card's memory (`crate::host`), on the
     /// software adapter. Told 1 it flags the pieces whose bytes are not

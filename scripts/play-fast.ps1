@@ -3,7 +3,8 @@
 #   -Safe          none of the switches
 #   -SmallCard     without the two switches that want 16 GB of card memory
 #   -Experimental  also the newest switches (see "Newer" in the README)
-#   -Ambient 0.6   a constant in place of the missing indirect light
+#   -Ambient 1     an estimate in place of the missing indirect light (a share of
+#                  it: 1 all; constant:0.6 the flat light of earlier versions)
 #   -Log <file>    the log goes to this file
 # Save your other work first: see "Known risks" in the README.
 param(

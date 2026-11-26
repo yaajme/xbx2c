@@ -27,7 +27,7 @@ powershell -ExecutionPolicy Bypass -File scripts\play-fast.ps1 -Exe "<game dir>\
 |---|---|
 | (nothing) | The switches in the first table |
 | `-Experimental` | Those and the ones in the second |
-| `-Ambient 0.6` | A constant in place of the missing indirect light |
+| `-Ambient 1` | An estimate in place of the missing indirect light (`constant:0.6`: the flat light of earlier versions) |
 | `-SmallCard` | Without the two switches that want 16 GB of card memory |
 | `-Safe` | No switch at all |
 | `-Log run.log` | The log goes to a file |
@@ -65,7 +65,7 @@ Newer, tried in a few launches at the one spot below (`-Experimental`):
 | `VICTORY_BURY_THREAD=1` | What is let go is freed on a thread of its own |
 | `VICTORY_WIDE_HASH=1`, `VICTORY_CARD_REHASH_RUNS=1` | Page hashes on the card by 64 lanes, and (victory-fork's) joined |
 | `VICTORY_ASYNC_SUBMIT=1`, `VICTORY_TEXTURE_NO_WAIT=1` | victory-fork's |
-| `VICTORY_AMBIENT=0.6` (`-Ambient 0.6`) | The indirect light, which needs rays that do not run, is a constant. By beloooo ([Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)) |
+| `VICTORY_AMBIENT=1` (`-Ambient 1`) | The indirect light, which needs rays that do not run, is estimated from the light the visible surfaces send out (avatarmanz, [VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)); `constant:<level>` is beloooo's constant ([Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)) |
 
 ## Always on
 
@@ -88,6 +88,11 @@ Newer, tried in a few launches at the one spot below (`-Experimental`):
   approximation). The stepped edges at a shoulder in the sun were gone in the
   one launch with it.
 - `VICTORY_WAVE_WIDE` takes a comma-separated list of container digests.
+- **Fix: blocks along the bottom of the picture.** Indirect dispatches were cut
+  at 65,535 thread groups; the title's tile pass asks for some 67,000, and the
+  last tiles never ran. On AMD and NVIDIA cards up to 2^20 now run as asked (a
+  test checks every group on the card; `VICTORY_INDIRECT_WIDE=0` turns it off).
+  From avatarmanz/VIctory-7900XTX `84eae35`.
 
 ## Fixed since `b79832e`
 
@@ -110,10 +115,13 @@ milliseconds either way are noise.
 | victory-fork `9376fd6`, defaults (1 launch) | 207-228 | 4.4-4.8 |
 | this fork `b79832e`, its switches (4 launches) | 105-125 | 8.0-9.6 |
 
-Builds close to the newest, with every experimental switch, `VICTORY_AMBIENT=0.6`
+Builds close to `2756021`, with every experimental switch, the constant light at 0.6
 and five digests in `VICTORY_WAVE_WIDE`: 103-110 ms (1 launch; standing still, after one to two minutes of 150-1,300 ms frames as the world loads),
 102-117 with a profiler on and the hair shadows (1 launch). No faster than `b79832e` by more than the noise; what it buys is a
-shorter copy-back and the fixes above. About 15 GB of card memory and 16 GB of RAM were in use.
+shorter copy-back and the fixes above.
+
+With the two ports of 26 November (the estimated light at 1, wide indirect
+dispatches): 104-118 ms in the same view (1 launch). About 15 GB of card memory and 16 GB of RAM were in use.
 
 ## Known risks and problems
 
