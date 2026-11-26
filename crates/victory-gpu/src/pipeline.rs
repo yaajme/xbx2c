@@ -137,6 +137,8 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether it can store through raw addresses ([`stores_by_address`]).
+    pub(crate) stores_by_address: bool,
 }
 
 #[cfg(windows)]
@@ -195,6 +197,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -205,7 +208,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated { host, used, stores, stores_by_address })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -430,6 +433,23 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
             Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
             _ => false,
         }
+    })
+}
+
+/// Whether a console program can store to memory through raw addresses
+/// (`crate::memory`): a flat or global store or atomic, or code that does
+/// not decode. The programs that only walk ray-tracing structures do not,
+/// whatever they store through views.
+#[cfg(windows)]
+fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        matches!(i.encoding, Encoding::Flat | Encoding::Global)
+            && i.name()
+                .is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"))
     })
 }
 
