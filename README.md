@@ -1,7 +1,7 @@
 # xbx2c (Xbox SeriesX to CoreWin): a faster fork of victory-fork (work in progress)
 
 A fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork)
-(merged up to `f85101b`), which is itself a fork of
+(its changes up to `64f3a82` taken in), which is itself a fork of
 [VIctory](https://github.com/Marvisak/VIctory). It adds frame-rate work and a
 few fixes. The frame-rate switches are off by default. It is **not playable
 yet**.
@@ -10,11 +10,10 @@ yet**.
 copy of the game. Not affiliated with or endorsed by its developer or
 publisher.
 
-> **The newest commit itself has not reached the world.** Two launches of builds
-> that differ from it in two small ways did (one switch more, since removed;
-> descriptor passes did not yet keep what an earlier pass had not taken). The run
-> of the commit was stopped while loading, when the machine ran low on memory. If it misbehaves, try `-Safe`, or
-> go back to `b79832e` (which has the faults named under "Fixed since `b79832e`").
+> **Work in progress.** The newest commit reached the world in two launches, one
+> with `VICTORY_THIN=1` and one without (no device loss). If it misbehaves, try
+> `-Safe`, or go back to `b79832e` (which has the faults named under "Fixed since
+> `b79832e`").
 
 ## Use
 
@@ -63,7 +62,8 @@ Newer, tried in a few launches at the one spot below (`-Experimental`):
 | `VICTORY_HEAP_SYNC_PAGES=1`, `VICTORY_SYNC_ASIDE=1` | Descriptor records copied as bytes: a page at a time, and on a thread of its own |
 | `VICTORY_WIDE_REFRESH=1` | victory-fork's: copies refreshed on several threads; here textures too |
 | `VICTORY_BURY_THREAD=1` | What is let go is freed on a thread of its own |
-| `VICTORY_WIDE_HASH=1`, `VICTORY_CARD_REHASH_RUNS=1` | Page hashes on the card by 64 lanes, and (victory-fork's) joined |
+| `VICTORY_CARD_HASH_WIDE=1`, `VICTORY_CARD_REHASH_RUNS=1` | victory-fork's: page hashes on the card by 64 lanes (this fork's `VICTORY_WIDE_HASH` before), and joined |
+| `VICTORY_THIN=1` | The title's list calls are written down and translated by 4 threads of ours (`VICTORY_THIN_THREADS`); needs `VICTORY_ASYNC_SUBMIT=1`. From avatarmanz/VIctory-7900XTX. Halves the submitting thread's work |
 | `VICTORY_ASYNC_SUBMIT=1`, `VICTORY_TEXTURE_NO_WAIT=1` | victory-fork's |
 | `VICTORY_AMBIENT=1` (`-Ambient 1`) | The indirect light, which needs rays that do not run, is estimated from the light the visible surfaces send out (avatarmanz, [VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)); `constant:<level>` is beloooo's constant ([Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)) |
 
@@ -121,7 +121,12 @@ and five digests in `VICTORY_WAVE_WIDE`: 103-110 ms (1 launch; standing still, a
 shorter copy-back and the fixes above.
 
 With the two ports of 26 November (the estimated light at 1, wide indirect
-dispatches): 104-118 ms in the same view (1 launch). About 15 GB of card memory and 16 GB of RAM were in use.
+dispatches): 104-118 ms in the same view (1 launch).
+
+With victory-fork's newest taken in (`64f3a82`): 109-127 ms (1 launch); with
+`VICTORY_THIN=1` on top, 102-115 ms (1 launch). THIN halves the submitting
+thread's work (54 to 27 ms a frame); the frame is now held by the copy-back of
+what shaders wrote (74-87 ms a frame on its own thread). About 15 GB of card memory and 16 GB of RAM were in use.
 
 ## Known risks and problems
 

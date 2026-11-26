@@ -34,7 +34,8 @@ if (-not $Safe) {
     if ($Experimental) {
         $env:VICTORY_ASYNC_SUBMIT = '1'
         $env:VICTORY_MERGE_FINE = '1'
-        $env:VICTORY_WIDE_HASH = '1'
+        $env:VICTORY_CARD_HASH_WIDE = '1'
+        $env:VICTORY_THIN = '1'
         $env:VICTORY_CARD_REHASH_RUNS = '1'
         $env:VICTORY_GUARD_ONCE = '1'
         $env:VICTORY_HEAP_SYNC_PAGES = '1'
