@@ -91,6 +91,24 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    virtual_alloc(
+        base,
+        size,
+        kind,
+        flags,
+        protect,
+        victory_gpu::title_memory_committed,
+    )
+}
+
+fn virtual_alloc(
+    base: *mut c_void,
+    size: usize,
+    kind: u32,
+    flags: u64,
+    protect: u32,
+    on_commit: impl FnOnce(usize, usize),
+) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -161,6 +179,14 @@ pub extern "system" fn XMemVirtualAlloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+    }
+    // Memory committed for the title: the GPU side's notes that blocks there
+    // are uncommitted go (`VICTORY_ABSENT_ONCE`).
+    if !at.is_null() && kind & MEM_COMMIT != 0 {
+        // Windows rounds a fixed commit's address down to a page. The
+        // caller's last byte can be in the next 64 KiB watch block.
+        let start = if base.is_null() { at } else { base };
+        on_commit(start as usize, size);
     }
     at
 }
@@ -1035,6 +1061,61 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_notifications_cover_both_blocks_of_an_unaligned_request() {
+        let reservation = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            MEM_RESERVE,
+            0,
+            PAGE_NOACCESS,
+        );
+        assert!(!reservation.is_null());
+        let first = reservation as usize;
+        let boundary = first + PAGE;
+        let mut notified = None;
+        let at = virtual_alloc(
+            (boundary - 1) as _,
+            2,
+            MEM_COMMIT,
+            0,
+            PAGE_READWRITE,
+            |start, size| {
+                notified = Some(start..start + size);
+            },
+        );
+        assert!(!at.is_null());
+        assert!((at as usize) < boundary - 1);
+        assert_eq!(query((boundary - 1) as _).host.State, MEM_COMMIT);
+        assert_eq!(query(boundary as _).host.State, MEM_COMMIT);
+        // SAFETY: this test owns the entire reservation.
+        assert_ne!(unsafe { VirtualFree(reservation, 0, MEM_RELEASE) }, 0);
+        let range = notified.expect("a successful commit notifies the GPU watch");
+        assert_eq!(
+            range.start / PAGE..range.end.div_ceil(PAGE),
+            first / PAGE..first / PAGE + 2
+        );
+    }
+
+    #[test]
+    fn commit_notification_uses_the_chosen_address_for_a_null_request() {
+        let mut notified = None;
+        let at = virtual_alloc(
+            std::ptr::null_mut(),
+            PAGE,
+            MEM_COMMIT,
+            0,
+            PAGE_READWRITE,
+            |start, size| {
+                notified = Some((start, size));
+            },
+        );
+        assert!(!at.is_null());
+        // SAFETY: this test owns the entire reservation.
+        assert_ne!(unsafe { VirtualFree(at, 0, MEM_RELEASE) }, 0);
+        assert_eq!(notified, Some((at as usize, PAGE)));
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.

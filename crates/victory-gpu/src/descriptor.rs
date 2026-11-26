@@ -125,11 +125,19 @@ const SHADER_VISIBLE: u32 = 1;
 
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
 /// start, end, heap.
+///
+/// Read by every lookup and by [`sync_heaps`], written only when a heap is
+/// made or dropped. It was a mutex, and [`sync_heaps`] holds it for its
+/// whole pass (15 ms a frame on the submitting thread): the profile of run
+/// 225 has the title's six recording threads waiting 48.5 ms a frame in
+/// [`shader_slot`] for it, each lookup itself a few nanoseconds. Readers no
+/// longer wait for each other. Nothing a holder calls takes it again.
 #[cfg(windows)]
-// (Read by every view the title writes, and by [`sync_heaps`] for all of its
-// pass, 8 ms a frame: as a plain lock the threads that record stood for it.
-// No reader asks again while it reads.)
 static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
+
+/// One [`sync_heaps`] at a time, as when the list above was a mutex.
+#[cfg(windows)]
+static SYNCING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
@@ -173,62 +181,38 @@ fn mirror(handle: u64) {
 /// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
-    sync_written(heaps_written());
-}
-
-/// A registered heap (its start, its address) and the ranges of it written
-/// since they were last taken.
-#[cfg(windows)]
-type HeapWritten = (u64, usize, Vec<(usize, usize)>);
-
-/// The first half of [`sync_heaps`]: what was written. (It asks the write
-/// watch, behind the lock a submission's preparing holds for most of its
-/// time: done beside that it stood for it.)
-#[cfg(windows)]
-fn heaps_written() -> Vec<HeapWritten> {
+    use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0")) {
-        return Vec::new();
-    }
-    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    heaps
-        .iter()
-        .filter_map(|&(start, end, at)| {
-            // SAFETY: registered heaps are live (removed when dropped).
-            let heap = unsafe { &*(at as *const Heap) };
-            let (Some(Some(_)), Some(written)) = (heap.host.get(), &heap.written) else {
-                return None;
-            };
-            let ranges = written.take(start as usize, end as usize);
-            (!ranges.is_empty()).then_some((start, at, ranges))
-        })
-        .collect()
-}
-
-/// The second: the records in those ranges that are new are mirrored.
-#[cfg(windows)]
-fn sync_written(taken: Vec<HeapWritten>) {
-    use std::sync::atomic::Ordering::Relaxed;
-    if taken.is_empty() {
         return;
     }
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
+    let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    for (start, at, ranges) in taken {
-        if !heaps.iter().any(|&(s, _, h)| (s, h) == (start, at)) {
-            continue;
-        }
+    for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
-        let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
+        let (Some(Some(host)), Some(written), Some(step)) =
+            (heap.host.get(), &heap.written, increment(heap.desc.kind))
+        else {
             continue;
         };
         let step = u64::from(step);
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        // With `VICTORY_HEAP_SYNC_CUT`: only the pages that hold slots the
+        // host heap has title slots for are taken and read ([`sync_cut`]).
+        let looked_end = if sync_cut() {
+            (start as usize).saturating_add(mirrored_count as usize * step as usize).min(end as usize)
+        } else {
+            end as usize
+        };
+        let asking = std::time::Instant::now();
+        let ranges = written.take(start as usize, looked_end);
+        SYNC_PARTS[0].fetch_add(asking.elapsed().as_micros() as u64, Relaxed);
         for (range_from, range_end) in ranges {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
@@ -238,15 +222,23 @@ fn sync_written(taken: Vec<HeapWritten>) {
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
                 page_bytes.resize(to - from, 0);
-                if crate::host::read_into(from as *const u8, &mut page_bytes) {
+                let reading = std::time::Instant::now();
+                let read = crate::host::read_into(from as *const u8, &mut page_bytes);
+                SYNC_PARTS[1].fetch_add(reading.elapsed().as_micros() as u64, Relaxed);
+                if read {
                     pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
-                    if host::sync_pages() {
-                        looked += slots.end - slots.start;
-                        mirrored += host.mirror_copied_page(slots, start, step, from, &page_bytes);
-                        page += crate::watch::PAGE;
-                        continue;
-                    }
+                    // The page's records in one go, under one lock
+                    // (`HostHeap::mirror_copied_page`); one by one below
+                    // with `VICTORY_HEAP_SYNC_PAGE=0`.
+                    let slots = if page_at_once() {
+                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes);
+                        looked += seen;
+                        mirrored += made;
+                        0..0
+                    } else {
+                        slots
+                    };
                     for index in slots {
                         let handle = start + index * step;
                         // A record that straddles the range's ends is left
@@ -280,12 +272,10 @@ fn sync_written(taken: Vec<HeapWritten>) {
 #[cfg(windows)]
 pub(crate) struct Syncing(());
 
-/// Passes asked for, and done; what those not done yet are of.
+/// Passes asked for, and done.
 #[cfg(windows)]
 static ASIDE: (std::sync::Mutex<(u64, u64)>, std::sync::Condvar) =
     (std::sync::Mutex::new((0, 0)), std::sync::Condvar::new());
-#[cfg(windows)]
-static ASIDE_OF: std::sync::Mutex<Vec<HeapWritten>> = std::sync::Mutex::new(Vec::new());
 
 /// Whether [`sync_heaps_aside`] is on (and its thread there).
 #[cfg(windows)]
@@ -304,10 +294,6 @@ pub(crate) fn syncs_aside() -> bool {
 #[cfg(windows)]
 pub(crate) fn sync_heaps_aside() -> Option<Syncing> {
     syncs_aside().then(|| {
-        // (After what an earlier pass has not taken yet: the watch tells of a
-        // range once.)
-        let taken = heaps_written();
-        ASIDE_OF.lock().unwrap_or_else(|e| e.into_inner()).extend(taken);
         ASIDE.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
         ASIDE.1.notify_all();
         Syncing(())
@@ -345,13 +331,63 @@ fn syncs() {
             }
         }
         let done = Done;
-        let of = std::mem::take(&mut *ASIDE_OF.lock().unwrap_or_else(|e| e.into_inner()));
-        if std::panic::catch_unwind(|| sync_written(of)).is_err() {
+        if std::panic::catch_unwind(sync_heaps).is_err() {
             tracing::error!("the pass over descriptors copied as bytes panicked");
         }
         drop(done);
     }
 }
+
+/// Whether [`sync_heaps`] leaves alone the part of a title view heap the
+/// host heap has no title slots for (`VICTORY_HEAP_SYNC_CUT=1`; off by
+/// default; `alt`: twenty seconds with, twenty without, in turn, each
+/// change said in the log).
+///
+/// On a host that caps view heaps at 1,000,000 the host heap holds the
+/// title's slots below 737,855 and the title's heap has 1,245,184. The
+/// records past the host's title slots were never mirrored
+/// ([`changed_slots`] cuts them off), but their pages were asked about and
+/// read all the same, and they are the busiest of the heap: the title
+/// keeps its own per-draw tables there and rewrites them every frame
+/// (measured in run 285 with an instrument since removed: about 100,000
+/// records a frame that are not zeros, a third of them live view objects,
+/// a fifth constant views; about half of the changed pages a frame). The
+/// layer serves those tables from slots of its own when a draw names
+/// them. With the switch the pass asks the write watch about, and reads,
+/// the mirrored part only: the same records are mirrored.
+#[cfg(windows)]
+fn sync_cut() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_HEAP_SYNC_CUT").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "the pass over the title's view heap leaves the part the host has no title slots for alone from now                      (VICTORY_HEAP_SYNC_CUT=alt): {}",
+                    if on { "ON" } else { "off, every changed page is read as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Microseconds of [`sync_heaps`] by part, since its line last took them:
+/// asking the write tracking which pages changed, reading the pages, the
+/// walk over their records (`HostHeap::mirror_copied_page`), and making
+/// the host slots of the records that changed. An instrument: the pass is
+/// 8 to 13 ms a frame and cutting the pages read took nothing off it (run
+/// 286).
+pub(crate) static SYNC_PARTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
@@ -376,6 +412,24 @@ pub(crate) fn sync_line(frames: f64) {
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
         micros as f64 / 1000.0 / frames
     );
+    let parts = [0, 1, 2, 3].map(|i| SYNC_PARTS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e3 / frames);
+    tracing::info!(
+        "the pass over the title's view heap by part, ms per frame: asking which pages changed {:.2}, reading the pages {:.2},          the walk over their records {:.2}, making the host slots of the changed records {:.2}",
+        parts[0],
+        parts[1],
+        parts[2],
+        parts[3]
+    );
+}
+
+/// Whether [`sync_heaps`] hands a changed page's records to the host heap
+/// in one go (`host::HostHeap::mirror_copied_page`). On by default: the
+/// same records are mirrored either way. `VICTORY_HEAP_SYNC_PAGE=0`: one
+/// by one, as before.
+#[cfg(windows)]
+fn page_at_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_PAGE").is_none_or(|v| v != "0"))
 }
 
 /// Title descriptor slots in a changed byte range that have host counterparts.

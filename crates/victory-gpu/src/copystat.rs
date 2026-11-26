@@ -984,6 +984,9 @@ pub(crate) fn recorded(started: std::time::Instant) {
     let ns = started.elapsed().as_nanos() as u64;
     add(C::RecordCalls, 1);
     add(C::RecordNs, ns);
+    crate::framelog::add(crate::framelog::T::RecordCalls, 1);
+    crate::framelog::add(crate::framelog::T::RecordNs, ns);
+    crate::framelog::here(crate::framelog::H::RecordNs, ns);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
@@ -997,6 +1000,12 @@ pub(crate) fn recorded(started: std::time::Instant) {
         return;
     }
     UNSENT.with(|u| u.set((0, 0)));
+    if crate::framelog::on() {
+        crate::framelog::add(crate::framelog::T::RecordLooks, 1);
+        if crate::framelog::on_slow_core() {
+            crate::framelog::add(crate::framelog::T::RecordSlow, 1);
+        }
+    }
     let id = thread_id();
     let mut all = RECORDERS.lock().unwrap_or_else(|e| e.into_inner());
     match all.iter_mut().find(|r| r.0 == id) {
@@ -1272,10 +1281,13 @@ pub(crate) fn log(frames: f64) {
     }
     tracing::info!(
         "  write-watch askings per frame that failed in the kernel: {:.0}; not made because the range \
-         is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway)",
+         is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway); such ranges left \
+         out of the submissions' askings ahead: {:.0}",
         c[C::WatchFailed as usize],
         c[C::WatchKnownView as usize],
+        crate::watch::AHEAD_VIEWS.swap(0, Relaxed) as f64 / frames,
     );
+    crate::draw::window_line(frames);
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \

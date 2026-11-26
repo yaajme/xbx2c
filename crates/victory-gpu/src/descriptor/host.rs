@@ -127,6 +127,22 @@ pub(crate) fn first_viewed(start: u64) -> Option<u32> {
 /// them ([`HostHeap::texture_views_remade`]).
 static RESHOWN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
+/// Since the start, of [`HostHeap::texture_views_remade`]: view slots made
+/// again, those of them made while a submission was in flight, and passes
+/// put off because one was (`VICTORY_VIEWS_REMADE_QUIET=1`).
+static VIEWS_REMADE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Whether view slots of textures with levels on demand are made again
+/// only while no submission is in flight (`VICTORY_VIEWS_REMADE_QUIET=1`;
+/// off by default: at every texture pass, as before). A texture then
+/// shows its new level a pass or more later. After fork pull request
+/// #1219, whose author lost the device with slots rewritten under lists
+/// already sent; whether that is behind the losses here is not known.
+fn views_remade_quiet() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEWS_REMADE_QUIET").is_some_and(|v| v == "1"))
+}
+
 /// The first level with memory of the placed texture at `start` changed:
 /// its slots are made again at the next texture pass.
 pub(crate) fn levels_changed(start: u64) {
@@ -1373,7 +1389,22 @@ impl HostHeap {
     const WAITING_A_PASS: usize = 128;
 
     pub(crate) fn texture_views_remade(&self) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
         if self.sampler {
+            return 0;
+        }
+        // The slots made again here are live slots of the heap the card
+        // reads, and the making is the layer's own, at a moment the title
+        // knows nothing of: a list already sent may be reading a slot while
+        // it is written (Direct3D 12 asks that a descriptor a submitted
+        // list reads is left alone until the list has run). Counted always;
+        // with `VICTORY_VIEWS_REMADE_QUIET=1` the pass is put off while a
+        // submission is in flight, and what is due stays due.
+        let flying = crate::host::submissions_in_flight();
+        if flying > 0 && views_remade_quiet() {
+            if !RESHOWN.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                VIEWS_REMADE[2].fetch_add(1, Relaxed);
+            }
             return 0;
         }
         let starts = std::mem::take(&mut *RESHOWN.lock().unwrap_or_else(|e| e.into_inner()));
@@ -1400,6 +1431,21 @@ impl HostHeap {
                 self.keep(slot, kept);
                 remade += 1;
             }
+        }
+        let before = VIEWS_REMADE[0].fetch_add(remade as u64, Relaxed);
+        if flying > 0 {
+            VIEWS_REMADE[1].fetch_add(remade as u64, Relaxed);
+        }
+        // Said at every 1,024 slots made again.
+        if (before + remade as u64) / 1024 != before / 1024 {
+            tracing::info!(
+                "view slots of textures with levels on demand made again, since the start: {}, {} of them while a submission was in flight \
+                 (a list already sent may have been reading the slot); {} passes put off for that (VICTORY_VIEWS_REMADE_QUIET=1: {})",
+                before + remade as u64,
+                VIEWS_REMADE[1].load(Relaxed),
+                VIEWS_REMADE[2].load(Relaxed),
+                if views_remade_quiet() { "on" } else { "off" }
+            );
         }
         remade
     }
@@ -1779,7 +1825,7 @@ impl HostHeap {
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+            SizeInBytes: constant_view_size(size),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -1850,43 +1896,76 @@ impl HostHeap {
         true
     }
 
-    /// [`HostHeap::mirror_copied`] for title slots `slots` of the heap at
-    /// `start`, whose records lie in `bytes`, read from `from` on: under one
-    /// lock, and the new ones mirrored after it. How many were.
-    pub(crate) fn mirror_copied_page(&self, slots: std::ops::Range<u64>, start: u64, step: u64, from: usize, bytes: &[u8]) -> u64 {
-        let frame = crate::frame::current();
-        let tables = sync_tables();
-        let mut tabled = 0;
-        let mut new: Vec<u32> = Vec::new();
+    /// [`HostHeap::mirror_copied`] for every record of one changed page of
+    /// the title's heap (`super::sync_heaps`): title slots `slots`, the
+    /// record of slot `i` at title address `start + i * step`, and `page`
+    /// the bytes read from title address `from` on. Returns the records
+    /// looked at and those mirrored.
+    ///
+    /// The same records are mirrored as one by one. What differs is the
+    /// work for the others, which are nearly all of them (some 330,000
+    /// looked at a frame for 14,000 mirrored, 16 ms, run 225): the lock of
+    /// the fingerprints is taken once for the page and not once for each
+    /// record, and a record whose fingerprint is the one last seen is done
+    /// with before the question whether its slot was a table's lately. So
+    /// the count of slots "left to the draws" is now of records that
+    /// changed, not of every record on the page. The slots to mirror are
+    /// made after the page's walk, in slot order as before.
+    pub(crate) fn mirror_copied_page(
+        &self,
+        slots: std::ops::Range<u64>,
+        (start, step): (u64, u64),
+        from: usize,
+        page: &[u8],
+    ) -> (u64, u64) {
+        let (frame, tables) = (crate::frame::current(), sync_tables());
+        let mut looked = 0u64;
+        let mut due: Vec<(u32, u64)> = Vec::new();
+        let walking = std::time::Instant::now();
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             if copied.is_empty() {
                 copied.resize(self.count as usize, 0);
             }
             for index in slots {
-                let Some(at) = ((start + index * step) as usize).checked_sub(from) else {
+                let handle = start + index * step;
+                // A record that straddles the range's ends is left to the
+                // range that holds its first byte.
+                let Some(at) = (handle as usize).checked_sub(from) else {
                     continue;
                 };
-                let Some(record) = bytes.get(at..at + step as usize) else {
+                let Some(record) = page.get(at..at + step as usize) else {
                     continue;
                 };
+                looked += 1;
+                // None past the host heap's slots, as `mirror_copied`.
                 let Some(last) = copied.get_mut(index as usize) else {
                     continue;
                 };
-                if !tables && self.tabled_lately(index as u32, frame) {
-                    tabled += 1;
+                // Never 0, which is "never looked at".
+                let print = record_print(record) | 1;
+                // The record last seen, or a slot never looked at that
+                // holds nothing: as it was.
+                if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
                     continue;
                 }
-                if print_is_new(last, record) {
-                    new.push(index as u32);
+                // A table's slot lately: left to its draws, and looked at
+                // again next time.
+                if !tables && self.tabled_lately(index as u32, frame) {
+                    COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
                 }
+                *last = print;
+                due.push((index as u32, handle));
             }
         }
-        COPIED_TABLED.fetch_add(tabled, std::sync::atomic::Ordering::Relaxed);
-        for &index in &new {
-            self.mirror(index, start + u64::from(index) * step, false);
+        let making = std::time::Instant::now();
+        for &(index, handle) in &due {
+            self.mirror(index, handle, false);
         }
-        new.len() as u64
+        super::SYNC_PARTS[2].fetch_add((making - walking).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        super::SYNC_PARTS[3].fetch_add(making.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        (looked, due.len() as u64)
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -2225,24 +2304,6 @@ fn record_print(record: &[u8]) -> u64 {
         h = (h ^ u64::from(b)).wrapping_mul(K);
     }
     h ^ (h >> 32)
-}
-
-/// Whether `record` is not the one whose print is `last`, which then is its.
-fn print_is_new(last: &mut u64, record: &[u8]) -> bool {
-    let print = record_print(record) | 1;
-    // A slot never looked at that holds nothing: as it was.
-    if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
-        return false;
-    }
-    *last = print;
-    true
-}
-
-/// Whether the pass over records copied as bytes takes a page's records
-/// together (`VICTORY_HEAP_SYNC_PAGES=1`; off by default: a lock a record).
-pub(crate) fn sync_pages() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_PAGES").is_some_and(|v| v == "1"))
 }
 
 /// Whether a buffer view off its buffer's elements gets a copy of its own
@@ -2690,6 +2751,25 @@ fn twin_uav(
     Some(desc)
 }
 
+/// The size of a constant buffer view the host takes: 256-byte steps, and
+/// at most 4,096 vectors (65,536 bytes, `D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT`).
+/// The title names constant views of more (one of 1,306,368 bytes, in the
+/// world); `CreateConstantBufferView` with such a size is an invalid call,
+/// and NVIDIA removes the device for it (`DXGI_ERROR_INVALID_CALL`), in
+/// the frame the view is made. A shader reads at most 4,096 vectors through
+/// a constant view, so nothing it can read is lost.
+fn constant_view_size(size: u32) -> u32 {
+    const MOST: u32 = 4096 * 16;
+    // The cap before the rounding (fork pull request #1206): a size within
+    // 255 of the largest number would round past it, to 0 in a release
+    // build, and a view of no bytes be made with no line said.
+    if size > MOST {
+        once!(size, "a constant buffer view over 64 KiB, made 64 KiB (the host takes no more)");
+        return MOST;
+    }
+    size.max(1).next_multiple_of(256)
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -2708,7 +2788,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: constant_view_size(size),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -3100,6 +3180,19 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A constant view is made in 256-byte steps and at most 64 KiB, the
+    /// most the host takes (a larger size removes the device on NVIDIA).
+    #[test]
+    fn constant_views_are_at_most_64_kib() {
+        assert_eq!(constant_view_size(16), 256);
+        assert_eq!(constant_view_size(256), 256);
+        assert_eq!(constant_view_size(65_536), 65_536);
+        assert_eq!(constant_view_size(1_306_368), 65_536);
+        assert_eq!(constant_view_size(65_537), 65_536);
+        assert_eq!(constant_view_size(u32::MAX), 65_536);
+        assert_eq!(constant_view_size(u32::MAX - 100), 65_536);
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.

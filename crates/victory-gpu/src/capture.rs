@@ -58,6 +58,18 @@ pub(crate) fn listed(n: u64) -> bool {
 /// stays empty.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
+    // A frame shot (`crate::shot`) keeps every line of its frame.
+    if crate::shot::keeping_lines() {
+        let text = what();
+        crate::shot::line(list, &text);
+        return op_listed(list, move || text);
+    }
+    op_listed(list, what);
+}
+
+/// [`op`] for the frames [`listed`] and the lines before the world.
+#[cfg(feature = "diagnostics")]
+fn op_listed(list: usize, what: impl FnOnce() -> String) {
     use std::io::Write;
     let frame = crate::queue::presented() + 1;
     if !listed(frame) {
@@ -120,6 +132,22 @@ fn world_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_WORLD").is_some())
 }
 
+/// Every how many world frames a picture is saved with
+/// `VICTORY_CAPTURE_WORLD` (`VICTORY_CAPTURE_WORLD_EVERY`, 8 unless said).
+///
+/// A saved frame is read back at once and written as a PNG inside the
+/// present: run 225's frame log has every saved frame of the cell at 371 ms
+/// against a usual 136 (the present's own copy and show 137 ms instead of
+/// 2, and 123 ms more waiting for the card). At every 8th frame that was
+/// the regular dip of every test run, and a fifth of its time. A run that
+/// measures speed asks for 64 or more.
+fn world_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_CAPTURE_WORLD_EVERY").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(8)
+    })
+}
+
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
@@ -151,7 +179,7 @@ pub(crate) fn wanted(n: u64) -> bool {
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
+    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(world_every());
     folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
@@ -196,6 +224,24 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     }
 }
 
+/// A PNG of `w` by `h` 8-bit RGB pixels; `raw` is its rows, each after a
+/// filter byte 0 (for `crate::shot`, whose pictures have names and sizes
+/// of their own).
+pub(crate) fn png_rgb(w: u32, h: u32, raw: &[u8]) -> Vec<u8> {
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut header = Vec::new();
+    header.extend(w.to_be_bytes());
+    header.extend(h.to_be_bytes());
+    header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
+    chunk(&mut png, b"IHDR", &header);
+    let mut compressed = vec![0u8; zlib_rs::compress_bound(raw.len())];
+    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, raw, zlib_rs::DeflateConfig::new(3));
+    debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
+    chunk(&mut png, b"IDAT", idat);
+    chunk(&mut png, b"IEND", &[]);
+    png
+}
+
 fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     png.extend((data.len() as u32).to_be_bytes());
     let start = png.len();
@@ -228,7 +274,7 @@ pub(crate) fn read_back(
 
 /// As [`read_back`], of subresource `sub` (the stencil plane of a
 /// one-level, one-slice depth-stencil texture is subresource 1).
-fn read_back_of(
+pub(crate) fn read_back_of(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
@@ -544,7 +590,7 @@ fn small_float(bits: u32, man: u32) -> f32 {
 /// as channel values scaled so the largest finite one is white (single
 /// channels: lowest black, highest white, as grey). `None` for formats not
 /// handled.
-fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);

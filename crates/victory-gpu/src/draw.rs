@@ -181,9 +181,159 @@ const WINDOW_MOST: u64 = 64;
 /// (`crate::indirect::bound_ahead`); a tail record that looks real is
 /// charged what it asks, a few thousand of 2^27. And arguments the title's CPU side changes are seen as
 /// before, at the next submission.
+///
+/// Off for the rest of the run from the first error the card's driver
+/// reports to the system (`crate::drvwatch`): every loss of the card in a
+/// run with windows was announced that way seconds ahead.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")) && !crate::drvwatch::tripped()
+}
+
+/// Whether a record that is not on the window's walk opens a window of its
+/// own at once, with the step the title was last seen to walk that
+/// argument buffer by (`VICTORY_WINDOW_JUMP=1`; `alt`: twenty seconds
+/// with, twenty without, in turn, each change said in the log). Off by
+/// default. Needs [`windows`].
+///
+/// Run 243 counted, per frame, 2,370 indirect commands read from a window
+/// and 2,370 clamped by a pass of ours; 960 of those passes were for
+/// records "off the window's walk": the title draws a few records one
+/// after the other and then jumps to another place in the same argument
+/// buffer, some 480 times a frame. The record after a jump was clamped
+/// alone (its step is not known from one record), and the one after it
+/// opened a window of sixteen: two passes a jump, each one a trip of the
+/// card from drawing to compute and back (9 microseconds in the game).
+///
+/// With the switch the step of the last window that draws did read from
+/// is remembered with its argument buffer, kind and stride, and a record
+/// that would be clamped alone on that buffer opens sixteen records at
+/// that step instead: what the next record would have opened anyway, one
+/// record earlier, so no more of the list's budget is spent than before.
+/// If no draw reads from a window opened that way before the next pass,
+/// the step is forgotten until a walk shows it again: a title that draws
+/// lone records all over a buffer gets what it had.
+fn jump_windows() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_WINDOW_JUMP").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a record off the window's walk opens a window at the remembered step from now (VICTORY_WINDOW_JUMP=alt): {}",
+                    if on { "ON" } else { "off, as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Whether a single record that misses its window is gathered: given a
+/// slot that the list's prelude fills in one pass with the list's other
+/// such records, in place of a pass of ours in front of its draw
+/// (`crate::indirect::gather`; `VICTORY_INDIRECT_GATHER=1`; `alt`: twenty
+/// seconds with, twenty without, in turn, each change said in the log).
+/// Off by default. Needs [`windows`].
+fn gathers() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_INDIRECT_GATHER").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "single indirect records are gathered for their list's prelude from now (VICTORY_INDIRECT_GATHER=alt): {}",
+                    if on { "ON" } else { "off, as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// The records of a window opened at a remembered step ([`jump_windows`]):
+/// what the record after a lone one opens.
+const WINDOW_JUMP: u32 = 16;
+
+/// What a record that would be clamped alone opens instead, if the step
+/// its argument buffer is walked by is remembered: that step and how many
+/// records (never past the buffer, of which `left` bytes are left from
+/// the record on). None if nothing is remembered for this buffer, kind
+/// and stride, or no second record fits.
+fn jump_window(remembered: Option<(u64, u32, u32, u32)>, (copy, kind, stride): (u64, u32, u32), left: u64) -> Option<(u32, u32)> {
+    let (c, k, s, step) = remembered?;
+    if (c, k, s) != (copy, kind, stride) || step == 0 {
+        return None;
+    }
+    let fit = (left / u64::from(step)).min(u64::from(WINDOW_JUMP)) as u32;
+    (fit > 1).then_some((step, fit))
+}
+
+/// Diagnostics of [`windows`]: indirect commands since the last line, by
+/// what became of their clamp. In order: read from a window (no pass of
+/// ours); then clamped by a pass of ours because: it is a dispatch; it
+/// asks for more than one record; it has a count buffer; its shaders can
+/// store to buffers; it is the list's first; there was no window on its
+/// argument buffer (another buffer, kind or stride, or the window was
+/// ended); its record does not continue the window's walk; it is past the
+/// window's end (the next window: as meant). And the records those passes
+/// clamped in all; the passes that opened a window at a remembered step
+/// ([`jump_windows`]), and those of them no draw read from; the commands
+/// that read a gathered record ([`gathers`]: no pass of ours either), and
+/// those that asked for one and got none (the list no longer gathers, or
+/// its set is full).
+#[cfg(feature = "diagnostics")]
+pub(crate) static WINDOW_WHY: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
+
+/// The line of [`WINDOW_WHY`], per frame over `frames` frames.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn window_line(frames: f64) {
+    let n: Vec<f64> = WINDOW_WHY.iter().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames.max(1.0)).collect();
+    let g: Vec<f64> = crate::indirect::GATHER_NONE.iter().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames.max(1.0)).collect();
+    tracing::info!(
+        "indirect commands per frame by their clamp: {:.0} read from a window (no pass of ours); a pass of ours for {:.0}: {:.0} dispatches, {:.0} of more than one record, {:.0} with a count \
+         buffer, {:.0} whose shaders can store to buffers, {:.0} first on their list, {:.0} with no window on their argument buffer, {:.0} off the window's walk, {:.0} past the window's end; \
+         {:.0} records clamped by those passes; {:.0} of the passes opened a window at a remembered step (VICTORY_WINDOW_JUMP=1), {:.0} of those windows were read by no draw; \
+         {:.0} read a record gathered for their list's prelude (VICTORY_INDIRECT_GATHER=1), {:.0} asked for one and got none          (no fit for the clamp {:.0}, the list had stopped gathering {:.0}, too many buffers {:.0}, the set full {:.0}, no buffer {:.0})",
+        n[0],
+        n[1..9].iter().sum::<f64>(),
+        n[1],
+        n[2],
+        n[3],
+        n[4],
+        n[5],
+        n[6],
+        n[7],
+        n[8],
+        n[9],
+        n[10],
+        n[11],
+        n[12],
+        n[13],
+        g[0],
+        g[1],
+        g[2],
+        g[3],
+        g[4],
+    );
 }
 
 /// Whether a single indirect draw without a count reads its record straight
@@ -290,6 +440,18 @@ pub(crate) struct State {
     /// the indirect light follows (`crate::ambient`): root parameter, bytes
     /// into the view heap.
     ambient_tables: Vec<(u8, u32)>,
+    /// With [`jump_windows`]: the argument buffer (its copy's number), kind
+    /// and stride of the last window of several records that a draw read
+    /// from, and that window's step.
+    walk_step: Option<(u64, u32, u32, u32)>,
+    /// Whether [`State::window`] was opened at the remembered step, and
+    /// whether a draw has read from it since.
+    window_jumped: bool,
+    window_read: bool,
+    /// Diagnostics: the argument buffer and the offset of the indirect
+    /// command before this one on the list.
+    #[cfg(feature = "diagnostics")]
+    last_indirect: (u64, u64),
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -2105,15 +2267,64 @@ impl State {
         });
     }
 
+    /// Whether the shaders of the pipeline bound now can store to buffers
+    /// (or the pipeline is not known): a draw with them may write the
+    /// arguments of draws after it, which ends a list's gathering
+    /// (`crate::indirect::gather`). The same test keeps such a draw out of
+    /// a window ([`windows`]).
+    fn may_store(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This).is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
+    }
+
+    /// What is about to be recorded may write arguments (`stores`: a
+    /// dispatch, or shaders that can store to buffers): the list's
+    /// gathering ends, whole, or with `crate::indirect::gather_by_copy`
+    /// only for the copies the shaders are declared to write as they are
+    /// prepared (`HostList::gather_wrote`), and whole only for a pipeline
+    /// the layer does not know.
+    fn gather_ends(&self, list: &HostList, stores: bool) {
+        if !stores {
+            return;
+        }
+        // Whole, as before: without the switch, for a pipeline the layer
+        // does not know, and for shaders that can store through a view
+        // that is NOT declared where they are prepared: a buffer picked
+        // from the view heap by an index the shader computes
+        // (`State::heap_buffers`: what such a shader writes through a
+        // picked unordered access view is declared nowhere), and title
+        // memory by address (`crate::memory::ready` declares the numbered
+        // copies once per list; a copy another list numbers after that is
+        // reached through the directory and not declared in this list).
+        let whole = !crate::indirect::gather_by_copy()
+            || crate::pipeline::host_pipeline(self.pipeline as This).is_none_or(|p| {
+                p.stages.iter().any(|stage| {
+                    let t = stage.translated();
+                    t.stores
+                        && (t.host.root_srvs.contains(&victory_shader::emit::SLOT_STRIDES)
+                            || t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY))
+                })
+            });
+        if whole {
+            list.gather_close();
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
         self.args_settled = false;
+        self.gather_ends(list, true);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
+            return;
+        }
+        // A program that walks ray-tracing structures nothing has built.
+        if crate::pipeline::walk_held(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("a walk of ray-tracing structures that are not built (VICTORY_BVH_HOLD=1)".to_owned());
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
@@ -2484,6 +2695,7 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         self.window = None;
         self.args_settled = false;
+        self.gather_ends(list, self.may_store());
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -2876,6 +3088,7 @@ impl State {
     ) {
         self.window = None;
         self.args_settled = false;
+        self.gather_ends(list, self.may_store());
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -2982,6 +3195,7 @@ impl State {
     ) {
         self.window = None;
         self.args_settled = false;
+        self.gather_ends(list, self.may_store());
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3030,6 +3244,13 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            return false;
+        }
+        // A program that walks ray-tracing structures nothing has built:
+        // dropped before the argument clamp, like a skipped one.
+        if crate::pipeline::walk_held(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("a walk of ray-tracing structures that are not built (VICTORY_BVH_HOLD=1)".to_owned());
             return false;
         }
         const DRAW: u32 = 0;
@@ -3149,10 +3370,38 @@ impl State {
             && !p.stages.iter().any(|stage| stage.translated().stores);
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
-        if !windowed || list.first_use(WINDOW_USE) {
+        let first_on_list = list.first_use(WINDOW_USE);
+        if !windowed || first_on_list {
             self.window = None;
         self.args_settled = false;
         }
+        if !windowed {
+            // A dispatch, or shaders that store to buffers: arguments may
+            // be written from here on.
+            self.gather_ends(list, true);
+        }
+        // Diagnostics: why this command gets a pass of ours, if it does.
+        #[cfg(feature = "diagnostics")]
+        let why_not = if !windows() {
+            usize::MAX
+        } else if kind == DISPATCH {
+            1
+        } else if max != 1 {
+            2
+        } else if count.is_some() {
+            3
+        } else if !windowed {
+            4
+        } else if first_on_list {
+            5
+        } else {
+            match &self.window {
+                None => 6,
+                Some(w) if !(w.copy == args.id() && w.kind == kind && w.stride == stride) => 6,
+                Some(w) if offset >= w.base && (offset - w.base) % u64::from(w.step) == 0 => 8,
+                Some(_) => 7,
+            }
+        };
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
         let hit = self
             .window
@@ -3160,8 +3409,18 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base, w.step));
-        let (bounded, at) = match hit {
-            Some((scratch, at, step)) => {
+        // A record that misses its window: a slot the list's prelude fills,
+        // if the list still gathers ([`gathers`]).
+        let gathered = if hit.is_none() && windowed && gathers() {
+            let slot = crate::indirect::gather(list, (&args.buffer, args.id()), offset, (kind, stride));
+            #[cfg(feature = "diagnostics")]
+            WINDOW_WHY[if slot.is_some() { 12 } else { 13 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            slot
+        } else {
+            None
+        };
+        let (bounded, at) = match (hit, gathered) {
+            (Some((scratch, at, step)), _) => {
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
                 if crate::indirect::window_check()
@@ -3176,9 +3435,37 @@ impl State {
                     self.host_pipeline = 0;
                     self.host_roots[1] = 0;
                 }
+                #[cfg(feature = "diagnostics")]
+                WINDOW_WHY[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if !self.window_read {
+                    self.window_read = true;
+                    if let Some(w) = self.window.as_ref().filter(|w| w.records > 1) {
+                        self.walk_step = Some((w.copy, w.kind, w.stride, w.step));
+                    }
+                }
                 (scratch, at)
             }
-            None => {
+            (None, Some((scratch, at))) => {
+                // The record's bytes are up to date when the list is
+                // submitted, as for a record clamped in the list.
+                args.refresh(list, arguments, len);
+                // Diagnostics of windows, for gathered records too: the
+                // record clamped again here and compared.
+                if crate::indirect::window_check() && crate::indirect::check_hit(list, (&args.buffer, offset), (kind, stride), &scratch, at) {
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                }
+                (scratch, at)
+            }
+            (None, None) => {
+                // A window opened at the remembered step that no draw read
+                // from: the title does not walk here by that step.
+                if self.window_jumped && !self.window_read {
+                    self.walk_step = None;
+                    #[cfg(feature = "diagnostics")]
+                    WINDOW_WHY[11].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.window_jumped = false;
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart
@@ -3200,6 +3487,22 @@ impl State {
                     }
                     _ => (stride, max),
                 };
+                // A record that would be clamped alone, on a buffer whose
+                // step is remembered: the window the next record would
+                // open, opened here ([`jump_windows`]).
+                let (step, records) = match (windowed && records == 1 && jump_windows())
+                    .then(|| jump_window(self.walk_step, (args.id(), kind, stride), args.left(arguments)))
+                    .flatten()
+                {
+                    Some(jumped) => {
+                        self.window_jumped = true;
+                        #[cfg(feature = "diagnostics")]
+                        WINDOW_WHY[10].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        jumped
+                    }
+                    None => (step, records),
+                };
+                self.window_read = false;
                 args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
@@ -3221,6 +3524,31 @@ impl State {
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
+                #[cfg(feature = "diagnostics")]
+                if why_not < WINDOW_WHY.len() {
+                    WINDOW_WHY[why_not].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    WINDOW_WHY[9].fetch_add(u64::from(records), std::sync::atomic::Ordering::Relaxed);
+                    // One in 256 of the draws that miss their window, said:
+                    // where the record lies against the window and against
+                    // the record drawn before it.
+                    if (6..=8).contains(&why_not) {
+                        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 256 == 0 {
+                            let (last_copy, last_offset) = self.last_indirect;
+                            tracing::info!(
+                                "a window miss (one in 256): cause {why_not}, kind {kind}, stride {stride}, buffer {} offset {offset:#x} ({} left); the command before it on the list: buffer {last_copy} offset \
+                                 {last_offset:#x} (this one is {} bytes on); the window it missed: {}; clamped now: {records} records at step {step}",
+                                args.id(),
+                                args.left(arguments),
+                                offset as i64 - last_offset as i64,
+                                match &self.window {
+                                    Some(w) => format!("buffer {} kind {} stride {} base {:#x} step {} records {} (this record is {} bytes from its base)", w.copy, w.kind, w.stride, w.base, w.step, w.records, offset as i64 - w.base as i64),
+                                    None => "none".to_string(),
+                                }
+                            );
+                        }
+                    }
+                }
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
                 self.window = windowed.then(|| Window {
@@ -3235,6 +3563,10 @@ impl State {
                 (bounded, 0)
             }
         };
+        #[cfg(feature = "diagnostics")]
+        {
+            self.last_indirect = (args.id(), offset);
+        }
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -3418,6 +3750,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            // Some compute-written textures are also read by the title CPU.
+            list.texture_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
@@ -3615,5 +3949,27 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lone_record_opens_a_window_at_the_remembered_step() {
+        // (a mesh dispatch is kind 10, a draw kind 0)
+        let remembered = Some((7u64, 10u32, 12u32, 32u32));
+        // the same buffer, kind and stride: sixteen records at the title's step
+        assert_eq!(jump_window(remembered, (7, 10, 12), 1 << 20), Some((32, 16)));
+        // never past the buffer: 100 bytes left hold three records 32 apart
+        assert_eq!(jump_window(remembered, (7, 10, 12), 100), Some((32, 3)));
+        // one record fits: nothing to open
+        assert_eq!(jump_window(remembered, (7, 10, 12), 40), None);
+        // another buffer, kind or stride, or nothing remembered: alone, as before
+        assert_eq!(jump_window(remembered, (8, 10, 12), 1 << 20), None);
+        assert_eq!(jump_window(remembered, (7, 0, 12), 1 << 20), None);
+        assert_eq!(jump_window(remembered, (7, 10, 16), 1 << 20), None);
+        assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
     }
 }

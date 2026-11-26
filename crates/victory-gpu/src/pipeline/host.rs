@@ -91,7 +91,70 @@ impl Default for GraphicsState {
     }
 }
 
+/// Whether a render target of `format` holds integers (`_UINT`, `_SINT`):
+/// the host does not blend into those.
+fn integer_target(format: DXGI_FORMAT) -> bool {
+    matches!(
+        format,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
+}
+
 impl GraphicsState {
+    /// Once the title's whole state is read: blending is off for the
+    /// render targets that hold integers. The title leaves it on for them
+    /// (the console's hardware does not blend integers, whatever the state
+    /// says); on the host a pipeline with it on is an invalid call, which
+    /// Direct3D's debug layer names (run 283: "The render target format at
+    /// slot 2 is format (R8_UINT). This format does not support blending
+    /// ... the Blend State indicates blending is enabled for this slot")
+    /// and which is undefined without the layer. A state that has no such
+    /// target is left as it is, bit for bit (its pipeline keeps its name in
+    /// the library). True if the state was changed.
+    pub(crate) fn integer_targets_do_not_blend(&mut self) -> bool {
+        let n = (self.targets.NumRenderTargets as usize).min(8);
+        let independent = self.blend.IndependentBlendEnable.as_bool();
+        // The state of target `i` as the host reads it.
+        let of = |i: usize| if independent { i } else { 0 };
+        let wrong: Vec<usize> = (0..n)
+            .filter(|&i| integer_target(self.targets.RTFormats[i]) && self.blend.RenderTarget[of(i)].BlendEnable.as_bool())
+            .collect();
+        if wrong.is_empty() {
+            return false;
+        }
+        if !independent {
+            // One state for all targets: each gets its own copy of it.
+            for i in 1..8 {
+                self.blend.RenderTarget[i] = self.blend.RenderTarget[0];
+            }
+            self.blend.IndependentBlendEnable = true.into();
+        }
+        for i in wrong {
+            self.blend.RenderTarget[i].BlendEnable = false.into();
+        }
+        true
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -1028,6 +1091,52 @@ mod tests {
 
     /// A mesh pipeline made once is loaded from the library the next time,
     /// not compiled again (a stream without a topology never loads).
+    /// Blending goes off for integer targets only, and a state without
+    /// one that blends is left bit for bit.
+    #[test]
+    fn integer_targets_do_not_blend() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
+        // No blending anywhere: untouched.
+        let before = format!("{:?}", g.blend);
+        assert!(!g.integer_targets_do_not_blend());
+        assert_eq!(format!("{:?}", g.blend), before);
+        // One state for all targets, blending on: each target its own
+        // state, off for the integer one alone.
+        g.blend.IndependentBlendEnable = false.into();
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.blend.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        assert!(g.integer_targets_do_not_blend());
+        assert!(g.blend.IndependentBlendEnable.as_bool());
+        assert!(g.blend.RenderTarget[0].BlendEnable.as_bool());
+        assert!(g.blend.RenderTarget[1].BlendEnable.as_bool());
+        assert_eq!(g.blend.RenderTarget[1].SrcBlend, D3D12_BLEND_SRC_ALPHA);
+        assert!(!g.blend.RenderTarget[2].BlendEnable.as_bool());
+        // Done once: nothing more to change.
+        assert!(!g.integer_targets_do_not_blend());
+        // Independent states, the integer target's own blending on.
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 2;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R32_UINT;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.blend.IndependentBlendEnable = true.into();
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.blend.RenderTarget[1].BlendEnable = true.into();
+        assert!(g.integer_targets_do_not_blend());
+        assert!(!g.blend.RenderTarget[0].BlendEnable.as_bool());
+        assert!(g.blend.RenderTarget[1].BlendEnable.as_bool());
+        // A target past the count is not looked at.
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R8_UINT;
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        assert!(!g.integer_targets_do_not_blend());
+    }
+
     #[test]
     fn a_mesh_pipeline_loads_from_the_library() {
         let Some(host) = host() else {
