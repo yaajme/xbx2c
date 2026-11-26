@@ -2339,6 +2339,29 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
+    /// A dispatch the console counts in threads, not groups (`DispatchX`
+    /// with flag 0x20; the ray-tracing structure builder's): as many groups
+    /// of the bound program as hold them. Taken for groups, a builder stage
+    /// ran up to 64 times its threads and stored over the structures after
+    /// its own (DexNom/VIctory bc3cd4b0, avatarmanz/VIctory-7900XTX
+    /// 810efe5).
+    /// shortcut: the lanes of the last group past the count run too (the
+    /// program is not told the count); at most a group less one.
+    pub(crate) fn dispatch_threads(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        let size = crate::pipeline::host_pipeline(self.pipeline as This)
+            .and_then(|p| p.stages.first().map(|s| s.translated().threads))
+            .flatten();
+        match size {
+            Some([a, b, c]) if a > 0 && b > 0 && c > 0 => {
+                self.dispatch(list, x.div_ceil(a), y.div_ceil(b), z.div_ceil(c));
+            }
+            _ => {
+                once!(x, y, z, "a dispatch counted in threads of a program whose group size is not known: run as groups");
+                self.dispatch(list, x, y, z);
+            }
+        }
+    }
+
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;

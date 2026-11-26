@@ -1403,7 +1403,17 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 
 /// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
 /// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+    /// The counts are threads, not groups.
+    const THREAD_DIMENSIONS: u32 = 0x20;
+    #[cfg(windows)]
+    if flags & THREAD_DIMENSIONS != 0 && thread_dimensions() {
+        count_dispatch();
+        with_state(this, |list, s| s.dispatch_threads(list, x, y, z));
+        return;
+    }
+    #[cfg(not(windows))]
+    let _ = flags;
     #[cfg(windows)]
     state::dispatch(this, x, y, z);
     #[cfg(not(windows))]
@@ -1411,6 +1421,14 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
         let _ = (this, x, y, z);
         count_dispatch();
     }
+}
+
+/// Whether `DispatchX`'s flag for counts in threads is honoured
+/// (`VICTORY_THREAD_DIMENSIONS=0`: taken for groups, as before).
+#[cfg(windows)]
+fn thread_dimensions() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THREAD_DIMENSIONS").is_none_or(|v| v != "0"))
 }
 
 /// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when

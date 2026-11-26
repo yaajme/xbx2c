@@ -139,6 +139,9 @@ pub(crate) struct Translated {
     pub(crate) stores: bool,
     /// Whether it can store through raw addresses ([`stores_by_address`]).
     pub(crate) stores_by_address: bool,
+    /// A compute program's thread-group size (`numthreads`), for dispatches
+    /// counted in threads (`crate::draw::State::dispatch_threads`).
+    pub(crate) threads: Option<[u32; 3]>,
 }
 
 #[cfg(windows)]
@@ -198,6 +201,10 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
+    let threads = programs.iter().find_map(|p| match &p.io {
+        victory_shader::native::StageIo::Cs(io) => Some(io.threads),
+        _ => None,
+    });
     let used = programs
         .into_iter()
         .find(|p| {
@@ -208,7 +215,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores, stores_by_address })
+    Ok(Translated { host, used, stores, stores_by_address, threads })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
