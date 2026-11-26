@@ -53,6 +53,10 @@ enum Held {
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
     Signal(usize, u64),
+    /// A submission whose lists are being translated ([`crate::list::thin`]):
+    /// its parts take its place once they are.
+    #[cfg(windows)]
+    Lists(std::sync::Arc<[std::sync::Arc<crate::list::thin::Recording>]>),
     /// With [`behind`]: the submission at the head of the line is being
     /// prepared and sent by our thread, with the line unlocked, so the
     /// title can add to its end meanwhile; whatever is added stays behind
@@ -136,6 +140,19 @@ fn submit_cut(this: This, lists: &[This]) {
     let Some(host) = crate::host::host() else {
         return;
     };
+    // Lists whose calls are written down: the submission waits in the line
+    // until threads of ours have translated them.
+    if crate::list::thin::on() {
+        lock(&queue(this).held).push(Held::Lists(crate::list::thin::submitted(lists)));
+        {
+            let mut waiting = lock(&WAITING);
+            if !waiting.contains(&(this as usize)) {
+                waiting.push(this as usize);
+            }
+        }
+        release_held(false);
+        return;
+    }
     let first = if !behind() && lock(&queue(this).held).is_empty() {
         lists
             .iter()
@@ -359,6 +376,31 @@ pub(crate) fn behind() -> bool {
     })
 }
 
+/// Whether submissions go into the line of a thread of ours ([`behind`]).
+#[cfg(windows)]
+pub(crate) fn line_on() -> bool {
+    behind()
+}
+
+/// Lists in the line may have been translated ([`crate::list::thin`]).
+#[cfg(windows)]
+pub(crate) fn line_moved() {
+    wake();
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// This thread does work the line waits for ([`no_drain_here`]).
+    static OURS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// This thread does work the line waits for: it never runs the line itself
+/// (it could wait there for its own work).
+#[cfg(windows)]
+pub(crate) fn no_drain_here() {
+    OURS.set(true);
+}
+
 /// Whether there is something for [`worker`] to look at.
 #[cfg(windows)]
 static WORK: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
@@ -396,7 +438,7 @@ thread_local! {
 /// submission keeps its place behind them.
 #[cfg(windows)]
 pub(crate) fn before_sync() {
-    if behind() && !RELEASING_HERE.get() {
+    if behind() && !RELEASING_HERE.get() && !OURS.get() {
         release_held_now(false);
     }
 }
@@ -433,10 +475,42 @@ fn release_held_now(all: bool) {
                         break;
                     }
                     Some(Held::Value(wait)) if !all && !value_met(wait) => break,
+                    Some(Held::Lists(recordings)) => {
+                        if !recordings.iter().all(|r| r.done()) {
+                            if !all {
+                                break;
+                            }
+                            // At a present everything goes: they are waited for.
+                            let recordings = recordings.clone();
+                            drop(held);
+                            recordings.iter().for_each(|r| r.wait());
+                            held = lock(line);
+                        }
+                        // Its parts take its place, as a submission of the
+                        // lists of ours they were translated into.
+                        let Some(Held::Lists(recordings)) = (!held.is_empty()).then(|| held.remove(0)) else {
+                            continue;
+                        };
+                        let backs: Vec<This> = recordings.iter().map(|r| r.back()).filter(|b| !b.is_null()).collect();
+                        let parts = crate::list::detach_parts(&backs);
+                        let mut place = 0;
+                        for (waits, taken, order) in parts {
+                            for w in waits {
+                                held.insert(place, Held::Value(w));
+                                place += 1;
+                            }
+                            held.insert(place, Held::Run(taken, order));
+                            place += 1;
+                        }
+                        drop(recordings);
+                        moved = true;
+                        continue;
+                    }
                     Some(_) => {}
                 }
                 match held.remove(0) {
                     Held::Wait(..) | Held::Running => {}
+                    Held::Lists(_) => {}
                     Held::Value(wait) => {
                         // Passed at a present without being met: what the
                         // queue stood at.

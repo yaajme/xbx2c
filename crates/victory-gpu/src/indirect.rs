@@ -1010,6 +1010,207 @@ void main() {
         }
     }
 
+    /// Which buffers the driver backs with write-combined blocks of the
+    /// process: per kind of heap, 64 buffers made, the write-combined
+    /// regions and commit that came with them. `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn write_combined_blocks_by_heap() {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_WRITECOMBINE, VirtualQuery};
+        let wc = || {
+            let (mut at, mut n, mut bytes) = (0usize, 0usize, 0usize);
+            let mut sizes = std::collections::BTreeMap::new();
+            loop {
+                let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                // SAFETY: a query of our own address space.
+                if unsafe { VirtualQuery(at as *const _, &mut m, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+                    break;
+                }
+                if m.State == MEM_COMMIT && m.Protect & PAGE_WRITECOMBINE != 0 {
+                    n += 1;
+                    bytes += m.RegionSize;
+                    *sizes.entry(m.RegionSize >> 20).or_insert(0) += 1;
+                }
+                at = m.BaseAddress as usize + m.RegionSize;
+            }
+            (n, bytes >> 20, sizes)
+        };
+        let commit = || {
+            use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            let mut m = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+            // SAFETY: our own process and a sized structure.
+            unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut m, m.cb) };
+            m.PagefileUsage >> 20
+        };
+        let Some(gpu) = WarpHarness::on(false) else {
+            return;
+        };
+        let custom = |page, pool| D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_CUSTOM, CPUPageProperty: page, MemoryPoolPreference: pool, ..Default::default() };
+        let plain = |kind| D3D12_HEAP_PROPERTIES { Type: kind, ..Default::default() };
+        let kinds = [
+            ("upload", plain(D3D12_HEAP_TYPE_UPLOAD), D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ),
+            ("readback", plain(D3D12_HEAP_TYPE_READBACK), D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST),
+            ("custom write-back L0", custom(D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+            ("default", plain(D3D12_HEAP_TYPE_DEFAULT), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+        ];
+        for size in [256u64 << 10, 4 << 20] {
+            for (name, heap, flags, state) in &kinds {
+                let (n0, b0, _) = wc();
+                let c0 = commit();
+                let mut made = Vec::new();
+                for _ in 0..64 {
+                    let desc = D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: size,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        Flags: *flags,
+                        ..Default::default()
+                    };
+                    let mut r: Option<ID3D12Resource> = None;
+                    // SAFETY: a plain creation.
+                    unsafe { gpu.device.CreateCommittedResource(heap, D3D12_HEAP_FLAG_NONE, &desc, *state, None, &mut r) }.unwrap();
+                    made.push(r.unwrap());
+                }
+                let (n1, b1, sizes) = wc();
+                eprintln!(
+                    "64 {name} buffers of {} KiB: write-combined regions +{} (+{} MB), commit +{} MB; regions by MB: {sizes:?}",
+                    size >> 10,
+                    n1 as i64 - n0 as i64,
+                    b1 as i64 - b0 as i64,
+                    commit() as i64 - c0 as i64
+                );
+                drop(made);
+            }
+        }
+        // Video memory as heaps: one of 256 MB, then 64 textures of 4 MiB
+        // committed one by one.
+        for heap_mb in [256u64, 1024] {
+            let c0 = commit();
+            let (n0, b0, _) = wc();
+            let desc = D3D12_HEAP_DESC {
+                SizeInBytes: heap_mb << 20,
+                Properties: plain(D3D12_HEAP_TYPE_DEFAULT),
+                Alignment: 0,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+            };
+            let mut h: Option<ID3D12Heap> = None;
+            // SAFETY: a plain creation.
+            unsafe { gpu.device.CreateHeap(&desc, &mut h) }.unwrap();
+            let (n1, b1, sizes) = wc();
+            eprintln!("a default heap of {heap_mb} MB: write-combined regions +{} (+{} MB), commit +{} MB; {sizes:?}", n1 as i64 - n0 as i64, b1 as i64 - b0 as i64, commit() as i64 - c0 as i64);
+            drop(h);
+        }
+        {
+            let c0 = commit();
+            let mut made = Vec::new();
+            for _ in 0..64 {
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: 1024,
+                    Height: 1024,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                    Flags: D3D12_RESOURCE_FLAG_NONE,
+                    ..Default::default()
+                };
+                let mut r: Option<ID3D12Resource> = None;
+                // SAFETY: a plain creation.
+                unsafe { gpu.device.CreateCommittedResource(&plain(D3D12_HEAP_TYPE_DEFAULT), D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r) }.unwrap();
+                made.push(r.unwrap());
+            }
+            eprintln!("64 committed textures of 4 MiB: commit +{} MB", commit() as i64 - c0 as i64);
+        }
+        // A shader-visible view heap of a million slots, as the host's.
+        let (n0, b0, _) = wc();
+        let c0 = commit();
+        // SAFETY: a plain creation.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            gpu.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1_000_000,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+        }
+        .unwrap();
+        let (n1, b1, sizes) = wc();
+        eprintln!("a shader-visible view heap of 1,000,000: write-combined regions +{} (+{} MB), commit +{} MB; {sizes:?}", n1 as i64 - n0 as i64, b1 as i64 - b0 as i64, commit() as i64 - c0 as i64);
+        drop(heap);
+    }
+
+    /// What a command allocator keeps of what a list recorded into it, after
+    /// the list has run and both were reset: the process's commit before,
+    /// with them full, and after the reset. `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn allocator_memory_after_reset() {
+        let commit = || {
+            use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            let mut m = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+            // SAFETY: our own process and a sized structure.
+            unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut m, m.cb) };
+            m.PagefileUsage as f64 / f64::from(1 << 20)
+        };
+        let Some(gpu) = WarpHarness::on(false) else {
+            return;
+        };
+        let worker = compile_cs(&gpu.device, WORKER_CS).expect("the worker must compile");
+        for commands in [1_000u32, 10_000, 50_000] {
+            const N: usize = 32;
+            let before = commit();
+            let mut made = Vec::new();
+            // SAFETY: plain objects, recorded, run, waited for and reset.
+            unsafe {
+                for _ in 0..N {
+                    let a: ID3D12CommandAllocator = gpu.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                    let l: ID3D12GraphicsCommandList =
+                        gpu.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &a, None).unwrap();
+                    l.SetComputeRootSignature(&worker.root);
+                    for i in 0..commands {
+                        l.SetPipelineState(&worker.pso);
+                        l.SetComputeRoot32BitConstant(0, i, 0);
+                        l.Dispatch(0, 1, 1);
+                    }
+                    l.Close().unwrap();
+                    made.push((a, l));
+                }
+                let full = commit();
+                let lists: Vec<Option<ID3D12CommandList>> = made.iter().map(|(_, l)| l.cast().ok()).collect();
+                gpu.queue.ExecuteCommandLists(&lists);
+                let fence: ID3D12Fence = gpu.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                gpu.queue.Signal(&fence, 1).unwrap();
+                while fence.GetCompletedValue() < 1 {
+                    std::thread::yield_now();
+                }
+                for (a, l) in &made {
+                    a.Reset().unwrap();
+                    l.Reset(a, None).unwrap();
+                    l.Close().unwrap();
+                }
+                let reset = commit();
+                drop(lists);
+                drop(made);
+                let gone = commit();
+                eprintln!(
+                    "allocators: {N} with {commands} dispatches each: commit +{:.1} MB full, +{:.1} MB after reset, +{:.1} MB once dropped ({:.2} MB each kept over a reset)",
+                    full - before,
+                    reset - before,
+                    gone - before,
+                    (reset - before) / N as f64
+                );
+            }
+        }
+    }
+
     /// Whether the card runs every group of an indirect dispatch of more than
     /// 65,535, each once under its own number ([`widest`]): the title's tile
     /// lists. On the first hardware adapter; with `VICTORY_INDIRECT_WIDE=1`

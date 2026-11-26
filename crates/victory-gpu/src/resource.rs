@@ -3178,6 +3178,9 @@ mod tests {
         slot::<Copy>(list, 0x80)(list, &to, 0, 0, 0, &from, null.cast());
         slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        // What the queue holds runs (with `VICTORY_THIN=1`: the list is
+        // translated by threads of ours and its submission waits for that).
+        crate::queue::release_held(true);
 
         // Read the host texture back into a readback buffer.
         let readback_heap = D3D12_HEAP_PROPERTIES {
@@ -3215,8 +3218,12 @@ mod tests {
         let host_image = host_resource(image).unwrap();
         let back = host.new_list().unwrap();
         let (_, before) = host_transition(image, 0x800).unwrap();
-        // The upload list holds the texture until it is reset.
-        assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) > 2);
+        // The upload list holds the texture until it is reset (a list whose
+        // calls were written down was translated into a list of ours, which
+        // went with its submission).
+        if !crate::list::thin::on() {
+            assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) > 2);
+        }
         use windows::core::Interface;
         let out_to = Location {
             resource: readback.as_raw().cast_const().cast(),

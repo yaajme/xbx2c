@@ -7493,6 +7493,7 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
+        crate::list::thin::line(frames);
         #[cfg(feature = "diagnostics")]
         crate::shadow::echo_line(frames);
         if crate::watch::beside_on() {
